@@ -13,6 +13,7 @@ from dllm.snapshot import (
     SnapshotError,
     diff_trees,
     git_path,
+    ignored_paths,
     repo_root,
     snapshot_tree,
     undo,
@@ -189,6 +190,137 @@ class SnapshotTests(unittest.TestCase):
             finally:
                 tempfile.tempdir = None
         self.assertEqual(list(tdir.iterdir()), [])
+
+    def _hostile_config(self):
+        script = Path(self.tmp) / "conv.sh"
+        script.write_text("#!/bin/sh\necho CONVERTED\n")
+        script.chmod(0o755)
+        Path(os.environ["GIT_CONFIG_GLOBAL"]).write_text(
+            "[diff]\n\tnoprefix = true\n\texternal = /usr/bin/true\n"
+            "[apply]\n\twhitespace = fix\n[color]\n\tui = always\n"
+            '[diff "conv"]\n\ttextconv = %s\n' % script
+        )
+
+    def test_hostile_global_config(self):
+        repo = make_repo(self.tmp)
+        (repo / "src").mkdir()
+        (repo / "src" / "util.py").write_text("x = 1  \n")
+        (repo / "data.bin").write_bytes(b"\x00\x01bin\n")
+        (repo / ".gitattributes").write_text("*.bin diff=conv\n")
+        self._hostile_config()
+        before = snapshot_tree(repo)
+        (repo / "src" / "util.py").write_text("x = 2  \n")
+        (repo / "data.bin").write_bytes(b"\x00\x02bin\n")
+        after = snapshot_tree(repo)
+        _, text, _ = diff_trees(repo, before, after)
+        self.assertNotIn("\x1b", text)
+        self.assertNotIn("CONVERTED", text)
+        self.assertIn("a/src/util.py", text)
+        undo(repo, before, after)
+        self.assertEqual(snapshot_tree(repo), before)
+        self.assertEqual((repo / "src" / "util.py").read_text(), "x = 1  \n")
+        self.assertEqual((repo / "data.bin").read_bytes(), b"\x00\x01bin\n")
+
+    def test_gitignore_drift(self):
+        repo = make_repo(self.tmp)
+        (repo / ".gitignore").write_text(".env\nnode_modules/\n")
+        run_git(repo, "add", ".gitignore")
+        run_git(repo, "commit", "-q", "-m", "ign")
+        (repo / ".env").write_text("SECRET_KEY=hunter2\n")
+        (repo / "node_modules").mkdir()
+        for i in range(300):
+            (repo / "node_modules" / ("f%d.js" % i)).write_text("x\n")
+        before = snapshot_tree(repo)
+        ign = ignored_paths(repo)
+        self.assertIn(".env", ign)
+        self.assertIn("node_modules/", ign)
+        (repo / ".gitignore").write_text("")
+        (repo / "new.txt").write_text("n\n")
+        after = snapshot_tree(repo, exclude=ign)
+        changes, text, _ = diff_trees(repo, before, after)
+        self.assertEqual({c.path for c in changes}, {".gitignore", "new.txt"})
+        self.assertNotIn("hunter2", text)
+        undo(repo, before, after, protect=ign)
+        self.assertEqual((repo / ".env").read_text(), "SECRET_KEY=hunter2\n")
+        self.assertTrue((repo / "node_modules" / "f299.js").exists())
+        self.assertFalse((repo / "new.txt").exists())
+
+    def test_exclude_special_names(self):
+        repo = make_repo(self.tmp)
+        (repo / ".gitignore").write_text("*.log\n")
+        weird = ["we ird!#[x].log", " lead.log"]
+        for w in weird:
+            (repo / w).write_text("l\n")
+        before = snapshot_tree(repo)
+        ign = ignored_paths(repo)
+        (repo / ".gitignore").write_text("")
+        after = snapshot_tree(repo, exclude=ign)
+        self.assertEqual({c.path for c in diff_trees(repo, before, after)[0]}, {".gitignore"})
+
+    def test_protect_refuses(self):
+        repo = make_repo(self.tmp)
+        before = snapshot_tree(repo)
+        (repo / "gen").mkdir()
+        (repo / "gen" / "o.txt").write_text("o\n")
+        (repo / "gen.txt").write_text("g\n")
+        after = snapshot_tree(repo)
+        with self.assertRaises(SnapshotError) as cm:
+            undo(repo, before, after, protect=["gen.txt"])
+        self.assertIn("gen.txt", str(cm.exception))
+        with self.assertRaises(SnapshotError):
+            undo(repo, before, after, protect=["gen/"])
+        self.assertTrue((repo / "gen.txt").exists())
+        self.assertTrue((repo / "gen" / "o.txt").exists())
+
+    def test_racy_index_not_lost(self):
+        repo = make_repo(self.tmp)
+        (repo / "r.txt").write_text("aaaa\n")
+        run_git(repo, "add", "r.txt")
+        (repo / "r.txt").write_text("bbbb\n")
+        before = snapshot_tree(repo)
+        (repo / "r.txt").write_text("cccc\n")
+        after = snapshot_tree(repo)
+        undo(repo, before, after)
+        self.assertEqual((repo / "r.txt").read_text(), "bbbb\n")
+
+    def test_subdir_covers_whole_repo(self):
+        repo = make_repo(self.tmp)
+        (repo / "pkg").mkdir()
+        (repo / "pkg" / "m.py").write_text("m\n")
+        sub = repo / "pkg"
+        before = snapshot_tree(sub)
+        self.assertEqual(before, snapshot_tree(repo))
+        (repo / "pkg" / "m.py").write_text("m2\n")
+        (repo / "top.txt").write_text("t\n")
+        after = snapshot_tree(sub)
+        self.assertEqual({c.path for c in diff_trees(sub, before, after)[0]}, {"pkg/m.py", "top.txt"})
+        undo(sub, before, after)
+        self.assertFalse((repo / "top.txt").exists())
+        self.assertEqual((repo / "pkg" / "m.py").read_text(), "m\n")
+
+    def test_empty_patch_with_different_trees_raises(self):
+        import dllm.snapshot as snap
+
+        repo = make_repo(self.tmp)
+        before = snapshot_tree(repo)
+        (repo / "z.txt").write_text("z\n")
+        after = snapshot_tree(repo)
+        real = snap._git
+
+        def fake(r, args, env=None, input=None):
+            if args and args[0] == "diff-tree" and "-p" in args:
+                return b""
+            return real(r, args, env=env, input=input)
+
+        with mock.patch.object(snap, "_git", fake):
+            with self.assertRaises(SnapshotError):
+                undo(repo, before, after)
+        self.assertTrue((repo / "z.txt").exists())
+
+    def test_inherited_git_dir_ignored(self):
+        repo = make_repo(self.tmp)
+        with mock.patch.dict(os.environ, {"GIT_DIR": os.path.join(self.tmp, "nope"), "GIT_INDEX_FILE": os.path.join(self.tmp, "nope.idx")}):
+            self.assertEqual(len(snapshot_tree(repo)), 40)
 
 
 if __name__ == "__main__":
