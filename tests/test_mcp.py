@@ -6,6 +6,7 @@ import subprocess
 import sys
 import threading
 import unittest
+from unittest import mock
 
 from helpers import SERVER_DIR, JsonRpcPipe
 
@@ -23,6 +24,9 @@ class McpServerTests(unittest.TestCase):
         def boom(args, cancel):
             raise RuntimeError("kaboom")
 
+        def none_handler(args, cancel):
+            return None
+
         def slow(args, cancel):
             if cancel.wait(5):
                 self.slow_saw_cancel.set()
@@ -33,12 +37,14 @@ class McpServerTests(unittest.TestCase):
             ToolSpec("echo", "echo text", {"type": "object", "properties": {"text": {"type": "string"}}}, echo),
             ToolSpec("boom", "always raises", schema, boom),
             ToolSpec("slow", "waits for cancel", schema, slow),
+            ToolSpec("none", "returns None", schema, none_handler),
         ]
         c2s_r, c2s_w = os.pipe()
         s2c_r, s2c_w = os.pipe()
         self.server_in = os.fdopen(c2s_r, "r", encoding="utf-8")
         self.server_out = os.fdopen(s2c_w, "w", encoding="utf-8")
-        self.pipe = JsonRpcPipe(os.fdopen(c2s_w, "w", encoding="utf-8"), os.fdopen(s2c_r, "r", encoding="utf-8"))
+        self.client_read = os.fdopen(s2c_r, "r", encoding="utf-8")
+        self.pipe = JsonRpcPipe(os.fdopen(c2s_w, "w", encoding="utf-8"), self.client_read)
         self.server = McpServer("fast-agent", VERSION, tools)
         self.thread = threading.Thread(target=self.server.serve, args=(self.server_in, self.server_out), daemon=True)
         self.thread.start()
@@ -50,6 +56,11 @@ class McpServerTests(unittest.TestCase):
         except Exception:
             pass
         self.thread.join(2)
+        # Closing the server's write end gives the client reader EOF, so it exits cleanly.
+        self.server_out.close()
+        self.pipe.close()
+        self.server_in.close()
+        self.assertEqual(self.pipe.parse_errors, [])
 
     def call(self, method, params=None):
         msg_id = self._next_id
@@ -78,7 +89,7 @@ class McpServerTests(unittest.TestCase):
     def test_tools_list(self):
         r = self.call("tools/list")
         tools = r["result"]["tools"]
-        self.assertEqual([t["name"] for t in tools], ["echo", "boom", "slow"])
+        self.assertEqual([t["name"] for t in tools], ["echo", "boom", "slow", "none"])
         for t in tools:
             self.assertIn("inputSchema", t)
 
@@ -94,6 +105,23 @@ class McpServerTests(unittest.TestCase):
     def test_unknown_tool_is_invalid_params(self):
         r = self.call("tools/call", {"name": "nope", "arguments": {}})
         self.assertEqual(r["error"]["code"], -32602)
+
+    def test_unhashable_tool_name_gets_error_reply(self):
+        r = self.call("tools/call", {"name": [], "arguments": {}})
+        self.assertEqual(r["error"]["code"], -32602)
+        self.assertEqual(self.call("ping")["result"], {})
+
+    def test_dispatch_exception_gets_internal_error_reply(self):
+        with mock.patch.object(McpServer, "_start_call", side_effect=RuntimeError("bad")):
+            r = self.call("tools/call", {"name": "echo", "arguments": {}})
+        self.assertEqual(r["error"]["code"], -32603)
+        self.assertEqual(self.call("ping")["result"], {})
+
+    def test_non_toolreply_return_is_error_result(self):
+        r = self.call("tools/call", {"name": "none", "arguments": {}})
+        self.assertTrue(r["result"]["isError"])
+        self.assertIn("ToolReply", r["result"]["content"][0]["text"])
+        self.assertEqual(self.call("ping")["result"], {})
 
     def test_unknown_method(self):
         r = self.call("does/not/exist")

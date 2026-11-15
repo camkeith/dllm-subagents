@@ -21,6 +21,7 @@ class JsonRpcPipe:
         self._to_server = to_server
         self._from_server = from_server
         self._messages: "queue.Queue[dict]" = queue.Queue()
+        self.parse_errors: list = []
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
 
@@ -28,7 +29,10 @@ class JsonRpcPipe:
         for line in self._from_server:
             line = line.strip()
             if line:
-                self._messages.put(json.loads(line))
+                try:
+                    self._messages.put(json.loads(line))
+                except ValueError:
+                    self.parse_errors.append(line)
 
     def send(self, message: dict) -> None:
         self.send_raw(json.dumps(message))
@@ -45,6 +49,14 @@ class JsonRpcPipe:
 
     def close_input(self) -> None:
         self._to_server.close()
+
+    def close(self) -> None:
+        for stream in (self._to_server, self._from_server):
+            try:
+                stream.close()
+            except Exception:
+                pass
+        self._reader.join(2)
 
 
 class FakeClient:

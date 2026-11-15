@@ -14,6 +14,7 @@ PARSE_ERROR = -32700
 INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
+INTERNAL_ERROR = -32603
 
 
 @dataclass
@@ -65,6 +66,8 @@ class McpServer:
                 self._dispatch(message)
             except Exception as exc:  # keep the read loop alive
                 _log("dispatch failed: %r" % (exc,))
+                if "id" in message:
+                    self._error(message["id"], INTERNAL_ERROR, "Internal error: %s" % type(exc).__name__)
         with self._inflight_lock:
             for event in self._inflight.values():
                 event.set()
@@ -116,9 +119,13 @@ class McpServer:
             self._error(msg_id, METHOD_NOT_FOUND, "Method not found: %s" % (method,))
 
     def _start_call(self, msg_id, params: dict) -> None:
-        spec = self._tools.get(params.get("name"))
+        name = params.get("name")
+        if not isinstance(name, str):
+            self._error(msg_id, INVALID_PARAMS, "Invalid params: tool name must be a string")
+            return
+        spec = self._tools.get(name)
         if spec is None:
-            self._error(msg_id, INVALID_PARAMS, "Unknown tool: %s" % (params.get("name"),))
+            self._error(msg_id, INVALID_PARAMS, "Unknown tool: %s" % (name,))
             return
         arguments = params.get("arguments")
         if not isinstance(arguments, dict):
@@ -131,14 +138,18 @@ class McpServer:
     def _run_call(self, msg_id, spec: ToolSpec, arguments: dict, cancel: threading.Event) -> None:
         try:
             reply = spec.handler(arguments, cancel)
+            if not isinstance(reply, ToolReply) or not isinstance(reply.text, str):
+                raise TypeError("handler returned %s instead of a ToolReply" % type(reply).__name__)
+            is_error = bool(reply.is_error)
+            text = reply.text
         except Exception as exc:
             _log("tool %s raised %r" % (spec.name, exc))
-            reply = ToolReply("%s failed: %s" % (spec.name, exc), is_error=True)
+            text, is_error = "%s failed: %s" % (spec.name, exc), True
         with self._inflight_lock:
             self._inflight.pop(msg_id, None)
         if cancel.is_set():
             return
-        self._result(msg_id, {"content": [{"type": "text", "text": reply.text}], "isError": bool(reply.is_error)})
+        self._result(msg_id, {"content": [{"type": "text", "text": text}], "isError": is_error})
 
     def _cancel(self, request_id) -> None:
         with self._inflight_lock:
