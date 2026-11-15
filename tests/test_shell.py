@@ -77,6 +77,28 @@ class RunCommandTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertEqual(len(r.output), 200001)
 
+    def test_escaped_descendant_does_not_steal_next_output(self):
+        code = (
+            "import os,time\n"
+            "if os.fork()==0:\n"
+            "    os.setsid(); print(os.getpid(),flush=True); time.sleep(30)\n"
+        )
+        start = time.time()
+        r = run_command("python3 -c '%s'" % code, os.getcwd(), 10)
+        pid = int(r.output.split()[0])
+
+        def cleanup():
+            try:
+                os.kill(pid, 9)
+            except ProcessLookupError:
+                pass
+
+        self.addCleanup(cleanup)
+        self.assertLess(time.time() - start, 6)
+        self.assertFalse(r.timed_out)
+        for _ in range(3):
+            self.assertEqual(run_command("echo hi", os.getcwd(), 10).output, "hi\n")
+
     def test_kill_all(self):
         out = []
         t = threading.Thread(target=lambda: out.append(run_command("sleep 30", os.getcwd(), 20)))
