@@ -30,6 +30,12 @@ class ApplyEditsTests(unittest.TestCase):
         self.assertIn("matches 2 times", str(cm.exception))
         self.assertIn("edit 1", str(cm.exception))
 
+    def test_self_overlapping_matches_are_not_unique(self):
+        for content, old, n in (("aaa", "aa", 2), ("a\n\n\nb", "\n\n", 2), ("}}}", "}}", 2)):
+            with self.assertRaises(EditError) as cm:
+                apply_edits(content, [e(old, "X")])
+            self.assertIn("matches %d times" % n, str(cm.exception))
+
     def test_overlap(self):
         with self.assertRaises(EditError) as cm:
             apply_edits("abcde", [e("abc", "X"), e("bcd", "Y")])

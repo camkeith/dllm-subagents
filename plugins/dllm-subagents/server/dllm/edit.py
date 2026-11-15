@@ -32,7 +32,8 @@ def apply_edits(content: str, edits: List[dict]) -> str:
         old, new = old.replace("\r\n", "\n"), new.replace("\r\n", "\n")
         if not old:
             raise EditError("edit %d: old_text is empty; provide the exact text to replace" % i)
-        count = text.count(old)
+        starts = _find_all(text, old)
+        count = len(starts)
         if count == 0:
             raise EditError(
                 "edit %d: old_text not found in the file; re-read the file and copy the text "
@@ -43,7 +44,7 @@ def apply_edits(content: str, edits: List[dict]) -> str:
                 "edit %d: old_text matches %d times; add more surrounding context to make it unique"
                 % (i, count)
             )
-        start = text.index(old)
+        start = starts[0]
         spans.append((start, start + len(old), new, i))
 
     ordered = sorted(spans)
@@ -65,6 +66,16 @@ def apply_edits(content: str, edits: List[dict]) -> str:
     if crlf:
         result = result.replace("\n", "\r\n")
     return bom + result
+
+
+def _find_all(text: str, old: str) -> List[int]:
+    """All start indexes of old in text, including self-overlapping matches."""
+    starts = []
+    i = text.find(old)
+    while i != -1:
+        starts.append(i)
+        i = text.find(old, i + 1)
+    return starts
 
 
 def _validate(edit: Any, i: int):
