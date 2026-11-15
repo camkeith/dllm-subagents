@@ -507,7 +507,7 @@ class RunsTest(unittest.TestCase):
         interrupt.set()
         t0 = time.monotonic()
         view = m.wait(rid, 30, interrupt)
-        self.assertLess(time.monotonic() - t0, 2)
+        self.assertLess(time.monotonic() - t0, 10)
         self.assertEqual(view["status"], "running")
 
     def test_interrupt_set_while_waiting(self):

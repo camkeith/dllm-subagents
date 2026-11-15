@@ -65,7 +65,7 @@ class ApplyEditsTests(unittest.TestCase):
         self.assertEqual(apply_edits("a\r\nb\r\n", [e("a\r\nb", "A\r\nB")]), "A\r\nB\r\n")
 
     def test_bom_preserved(self):
-        self.assertEqual(apply_edits("﻿hello", [e("hello", "bye")]), "﻿bye")
+        self.assertEqual(apply_edits("\ufeffhello", [e("hello", "bye")]), "\ufeffbye")
 
     def test_edits_list_required(self):
         for bad in ([], None, "x"):

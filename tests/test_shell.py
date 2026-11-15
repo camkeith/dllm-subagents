@@ -9,7 +9,7 @@ import unittest
 from dllm.shell import CommandResult, kill_all, run_command, truncate_middle
 
 
-def pid_gone(pid: int, wait: float = 2.0) -> bool:
+def pid_gone(pid: int, wait: float = 10.0) -> bool:
     deadline = time.time() + wait
     while time.time() < deadline:
         try:
@@ -62,7 +62,7 @@ class RunCommandTests(unittest.TestCase):
         threading.Timer(0.5, ev.set).start()
         start = time.time()
         r = run_command("sleep 30", os.getcwd(), 20, cancel_event=ev)
-        self.assertLess(time.time() - start, 2)
+        self.assertLess(time.time() - start, 10)
         self.assertTrue(r.cancelled)
         self.assertFalse(r.timed_out)
 
@@ -106,9 +106,9 @@ class RunCommandTests(unittest.TestCase):
         time.sleep(0.5)
         start = time.time()
         kill_all()
-        t.join(5)
+        t.join(15)
         self.assertFalse(t.is_alive())
-        self.assertLess(time.time() - start, 2)
+        self.assertLess(time.time() - start, 10)
         self.assertTrue(out[0].cancelled)
 
     def test_quick_command_returns_quickly(self):

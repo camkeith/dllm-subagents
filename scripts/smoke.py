@@ -61,13 +61,14 @@ def show_models(profile, key):
     return present
 
 
-def run_provider(profile, key, secret_names, limits, keep):
+def run_provider(profile, key, secret_names, limits, keep, redact=()):
     workdir = Path(tempfile.mkdtemp(prefix="dllm-smoke-%s-" % profile.name))
     traj = workdir / "trajectory.json"
     try:
         subprocess.run(["git", "init", "-q"], cwd=str(workdir), check=True)
         ctx = ToolContext(workdir, threading.Event(), env=scrubbed_env(secret_names))
-        agent = Agent(ChatClient(profile, key), ctx, limits, check_command=CHECK, trajectory_path=traj)
+        agent = Agent(ChatClient(profile, key), ctx, limits, check_command=CHECK, trajectory_path=traj,
+                      redact=redact)
         result = agent.run(build_task_message(TASK, str(workdir), CHECK, [], []))
     finally:
         if not keep:
@@ -93,6 +94,12 @@ def main(argv=None):
         print("Unknown provider(s): %s (known: %s)" % (", ".join(unknown), ", ".join(settings.profiles)))
         return 1
     secret_names = [p.api_key_env for p in settings.profiles.values()]
+    known_keys = []  # every key we can resolve is redacted, like RunManager does
+    for other in settings.profiles.values():
+        try:
+            known_keys.append(resolve_api_key(other))
+        except ConfigError:
+            pass
 
     keyed = []
     for name in names:
@@ -115,7 +122,8 @@ def main(argv=None):
     rows, failures, kept = [], [], []
     for profile, key in keyed:
         try:
-            result, workdir, traj = run_provider(profile, key, secret_names, settings.limits, args.keep)
+            result, workdir, traj = run_provider(profile, key, secret_names, settings.limits, args.keep,
+                                                 known_keys)
         except Exception as exc:
             rows.append((profile.name, profile.model, "crashed", "-", "-", "-", "-", "-"))
             failures.append((profile.name, "%s: %s" % (type(exc).__name__, exc)))

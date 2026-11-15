@@ -13,7 +13,7 @@ import unittest
 from unittest import mock
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from helpers import ROOT, SERVER_DIR
+from helpers import ROOT, SERVER_DIR, isolated_git_env
 
 SMOKE = os.path.join(ROOT, "scripts", "smoke.py")
 DEFAULTS = os.path.join(SERVER_DIR, "providers.default.json")
@@ -108,6 +108,7 @@ class SmokeTest(unittest.TestCase):
         for name in _shipped_key_vars():
             self.assertNotIn(name, env)
         env["DLLM_SUBAGENTS_CONFIG_DIR"] = self.cfg
+        env.update(isolated_git_env(self.tmp.name))
         return subprocess.run([sys.executable, SMOKE] + list(args), env=env,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               universal_newlines=True, timeout=120)
@@ -176,6 +177,7 @@ class SmokeTest(unittest.TestCase):
     def _main_in_process(self, module, *args):
         env = _minimal_env()
         env["DLLM_SUBAGENTS_CONFIG_DIR"] = self.cfg
+        env.update(isolated_git_env(self.tmp.name))
         out = io.StringIO()
         with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(out):
             code = module.main(list(args))
@@ -206,6 +208,27 @@ class SmokeTest(unittest.TestCase):
         self.assertEqual(len(made), 2)
         for path in made:
             self.assertFalse(os.path.exists(path), path)
+
+    def test_agent_redacts_every_resolvable_key(self):
+        other_key = "sk-other-secret-456"
+        with open(os.path.join(self.cfg, "config.json")) as f:
+            cfg = json.load(f)
+        cfg["providers"]["fake2"] = dict(cfg["providers"]["fake"], api_key_env="FAKE2_API_KEY")
+        with open(os.path.join(self.cfg, "config.json"), "w") as f:
+            json.dump(cfg, f)
+        self._keys("FAKE_API_KEY=%s\nFAKE2_API_KEY=%s\n" % (FAKE_KEY, other_key))
+        module = self._load_module()
+        seen = []
+        real = module.Agent
+
+        def spy(*args, **kwargs):
+            seen.append(sorted(kwargs.get("redact") or ()))
+            return real(*args, **kwargs)
+
+        with mock.patch.object(module, "Agent", spy):
+            code, out = self._main_in_process(module, "--provider", "fake")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(seen, [sorted([FAKE_KEY, other_key])])
 
     def test_bad_config_exits_1_without_traceback(self):
         with open(os.path.join(self.cfg, "config.json"), "w") as f:

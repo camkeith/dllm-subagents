@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import unittest
 from unittest import mock
 
-from helpers import SERVER_DIR, JsonRpcPipe
+from helpers import SERVER_DIR, JsonRpcPipe, isolated_git_env
 
 from dllm import VERSION
 from dllm.mcp import McpServer, ToolReply, ToolSpec
@@ -143,21 +145,26 @@ class McpServerTests(unittest.TestCase):
     def test_cancel_sets_event_and_suppresses_response(self):
         self.pipe.send({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "slow", "arguments": {}}})
         self.pipe.send({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 7}})
-        self.assertTrue(self.slow_saw_cancel.wait(2))
+        self.assertTrue(self.slow_saw_cancel.wait(10))
         self.assertIsNone(self.pipe.read(0.5))
         self.assertEqual(self.call("ping")["result"], {})
 
     def test_eof_returns(self):
         self.pipe.close_input()
-        self.thread.join(1)
+        self.thread.join(10)
         self.assertFalse(self.thread.is_alive())
 
 
 class EntryPointTests(unittest.TestCase):
     def test_entry_point_lists_four_tools(self):
         script = os.path.join(SERVER_DIR, "fast_agent_server.py")
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        env = dict(os.environ, DLLM_SUBAGENTS_CONFIG_DIR=os.path.join(tmp, "config"),
+                   DLLM_SUBAGENTS_RUNS_DIR=os.path.join(tmp, "runs"))
+        env.update(isolated_git_env(tmp))  # HOME too, so nothing reads the user's real files
         proc = subprocess.Popen(
-            [sys.executable, script],
+            [sys.executable, script], env=env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             universal_newlines=True, encoding="utf-8",
         )

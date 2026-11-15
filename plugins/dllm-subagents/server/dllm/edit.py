@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, List
 
-BOM = "﻿"
+BOM = "\ufeff"
 
 
 class EditError(Exception):
