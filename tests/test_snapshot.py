@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -257,6 +258,64 @@ class SnapshotTests(unittest.TestCase):
         after = snapshot_tree(repo, exclude=ign)
         self.assertEqual({c.path for c in diff_trees(repo, before, after)[0]}, {".gitignore"})
 
+    def _drift(self, files, gitignore="", global_ignore=None):
+        repo = make_repo(self.tmp)
+        if global_ignore:
+            Path(os.environ["GIT_CONFIG_GLOBAL"]).write_text(
+                "[core]\n\texcludesFile = %s\n" % global_ignore
+            )
+        for rel, data in files.items():
+            (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            (repo / rel).write_text(data)
+        return repo
+
+    def test_ignored_dir_not_ignored_itself(self):
+        gi = Path(self.tmp) / "global_ignore"
+        gi.write_text(".DS_Store\n")
+        repo = self._drift({"tools/.DS_Store": "x\n"}, global_ignore=gi)
+        before = snapshot_tree(repo)
+        ign = ignored_paths(repo)
+        self.assertEqual(ign, ["tools/.DS_Store"])
+        (repo / "tools" / "cli.py").write_text("print(1)\n")
+        after = snapshot_tree(repo, exclude=ign)
+        self.assertEqual([c.path for c in diff_trees(repo, before, after)[0]], ["tools/cli.py"])
+        undo(repo, before, after, protect=ign)
+        self.assertFalse((repo / "tools" / "cli.py").exists())
+        self.assertTrue((repo / "tools" / ".DS_Store").exists())
+
+    def test_nested_ignored_file_only(self):
+        repo = self._drift({".gitignore": "*.key\n", "src/conf/prod.key": "k\n"})
+        run_git(repo, "add", ".gitignore")
+        before = snapshot_tree(repo)
+        ign = ignored_paths(repo)
+        self.assertEqual(ign, ["src/conf/prod.key"])
+        (repo / "src" / "conf" / "app.cfg").write_text("c\n")
+        after = snapshot_tree(repo, exclude=ign)
+        self.assertEqual([c.path for c in diff_trees(repo, before, after)[0]], ["src/conf/app.cfg"])
+
+    def test_negation_written_by_run(self):
+        repo = self._drift({".gitignore": ".env\n", ".env": "SECRET_KEY=hunter2\n"})
+        run_git(repo, "add", ".gitignore")
+        before = snapshot_tree(repo)
+        ign = ignored_paths(repo)
+        (repo / ".gitignore").write_text("!.env\n")
+        after = snapshot_tree(repo, exclude=ign)
+        changes, text, _ = diff_trees(repo, before, after)
+        self.assertEqual([c.path for c in changes], [".gitignore"])
+        self.assertNotIn("hunter2", text)
+        undo(repo, before, after, protect=ign)
+        self.assertEqual((repo / ".env").read_text(), "SECRET_KEY=hunter2\n")
+
+    def test_trailing_space_filename(self):
+        repo = self._drift({".gitignore": "*.tmp*\n", "a.tmp  ": "t\n"})
+        run_git(repo, "add", ".gitignore")
+        before = snapshot_tree(repo)
+        ign = ignored_paths(repo)
+        self.assertEqual(ign, ["a.tmp  "])
+        (repo / ".gitignore").write_text("")
+        after = snapshot_tree(repo, exclude=ign)
+        self.assertEqual([c.path for c in diff_trees(repo, before, after)[0]], [".gitignore"])
+
     def test_protect_refuses(self):
         repo = make_repo(self.tmp)
         before = snapshot_tree(repo)
@@ -277,6 +336,7 @@ class SnapshotTests(unittest.TestCase):
         (repo / "r.txt").write_text("aaaa\n")
         run_git(repo, "add", "r.txt")
         (repo / "r.txt").write_text("bbbb\n")
+        time.sleep(1.1)  # make the real index older than "now" so a fresh-mtime copy would hide the edit
         before = snapshot_tree(repo)
         (repo / "r.txt").write_text("cccc\n")
         after = snapshot_tree(repo)

@@ -19,6 +19,8 @@ _SCRUB_ENV = (
     "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_COMMON_DIR",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
 )
 
 
@@ -39,9 +41,14 @@ def _git(
     args: List[str],
     env: Optional[Dict[str, str]] = None,
     input: Optional[bytes] = None,
+    ok_codes: Sequence[int] = (0,),
 ) -> bytes:
     cmd = ["git", "-c", "core.quotepath=false", "-c", "core.hooksPath=/dev/null"] + list(args)
-    full_env = {k: v for k, v in os.environ.items() if k not in _SCRUB_ENV}
+    full_env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in _SCRUB_ENV and not k.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+    }
     full_env["GIT_OPTIONAL_LOCKS"] = "0"
     if env:
         full_env.update(env)
@@ -53,7 +60,7 @@ def _git(
         raise SnapshotError("git %s timed out after %d s" % (args[0], _TIMEOUT))
     except OSError as exc:
         raise SnapshotError("could not run git: %s" % exc)
-    if proc.returncode != 0:
+    if proc.returncode not in ok_codes:
         stderr = proc.stderr.decode("utf-8", "replace").strip()
         raise SnapshotError("git %s failed: %s" % (args[0], stderr))
     return proc.stdout
@@ -82,7 +89,7 @@ def _user_global_excludes(repo: Path) -> bytes:
         out = ""
     candidates = []
     if out:
-        candidates.append(out)
+        candidates.append(os.path.join(str(repo), out))
     else:
         base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
         candidates.append(os.path.join(base, "git", "ignore"))
@@ -111,8 +118,7 @@ def _exclude_pattern(path: str) -> str:
     if text.startswith(" "):
         text = "\\" + text
     stripped = text.rstrip(" ")
-    if stripped != text:
-        text = stripped + "\\ " + " " * (len(text) - len(stripped) - 1)
+    text = stripped + "\\ " * (len(text) - len(stripped))
     return "/" + text + ("/" if is_dir else "")
 
 
@@ -120,7 +126,19 @@ def ignored_paths(repo: Path) -> List[str]:
     """Untracked paths currently ignored (directories end with '/'), without descending into them."""
     repo = repo_root(repo)
     out = _git(repo, ["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory"])
-    return [p for p in out.decode("utf-8", "replace").split("\0") if p]
+    listed = [p for p in out.decode("utf-8", "surrogateescape").split("\0") if p]
+    if not listed:
+        return []
+    # ls-files also lists untracked directories whose current contents are all ignored;
+    # keep only entries that are themselves ignored (exit 1 means none are).
+    checked = _git(
+        repo,
+        ["check-ignore", "-z", "--stdin"],
+        input="\0".join(listed).encode("utf-8", "surrogateescape") + b"\0",
+        ok_codes=(0, 1),
+    )
+    ignored = set(p for p in checked.decode("utf-8", "surrogateescape").split("\0") if p)
+    return [p for p in listed if p in ignored]
 
 
 def snapshot_tree(repo: Path, exclude: Sequence[str] = ()) -> str:
@@ -146,6 +164,19 @@ def snapshot_tree(repo: Path, exclude: Sequence[str] = ()) -> str:
                     fh.write((_exclude_pattern(p) + "\n").encode("utf-8", "surrogateescape"))
             add += ["-c", "core.excludesFile=" + ex]
         _git(repo, add + ["add", "-A"], env=env)
+        if exclude:
+            # Backstop: drop before-ignored paths even if the run un-ignored them (e.g. a
+            # `!path` rule in .gitignore), so they never reach the tree.
+            lst = os.path.join(tmpdir, "ignored.lst")
+            with open(lst, "wb") as fh:
+                for p in exclude:
+                    fh.write(p.encode("utf-8", "surrogateescape") + b"\0")
+            _git(
+                repo,
+                ["rm", "--cached", "-r", "-q", "--ignore-unmatch",
+                 "--pathspec-from-file=" + lst, "--pathspec-file-nul"],
+                env=dict(env, GIT_LITERAL_PATHSPECS="1"),
+            )
         return _git(repo, ["-c", "core.splitIndex=false", "write-tree"], env=env).decode().strip()
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
