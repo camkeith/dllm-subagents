@@ -1,0 +1,12 @@
+{
+  "name": "dllm-subagents",
+  "version": "0.1.0",
+  "description": "Hand build and edit jobs to a fast-model subagent",
+  "author": {
+    "name": "camkeith"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/camkeith/dllm-subagents",
+  "skills": "./skills/",
+  "mcpServers": "./codex.mcp.json"
+}
