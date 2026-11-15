@@ -5,9 +5,10 @@ import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Dict, Iterable, Mapping, Optional
 
 from .edit import EditError, apply_edits
+from .guard import check_command
 from .shell import run_command
 
 READ_DEFAULT_LIMIT = 2000
@@ -82,9 +83,16 @@ class ToolError(Exception):
 class ToolContext:
     workdir: Path
     cancel_event: threading.Event
-    guard: Optional[Callable[[str, str], Optional[str]]] = None
+    guard: Optional[Callable[[str, str], Optional[str]]] = check_command
     bash_default_timeout: int = 60
     bash_max_timeout: int = 300
+    env: Optional[Dict[str, str]] = None
+
+
+def scrubbed_env(names: Iterable[str], base: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
+    """A copy of base (default os.environ) without the named variables."""
+    drop = set(names)
+    return {k: v for k, v in (os.environ if base is None else base).items() if k not in drop}
 
 
 def resolve_in_workdir(workdir: Path, path: str) -> Path:
@@ -201,7 +209,7 @@ def _bash(args: dict, ctx: ToolContext) -> str:
         if reason:
             raise ToolError("blocked: %s" % reason)
     try:
-        res = run_command(command, workdir, timeout, ctx.cancel_event)
+        res = run_command(command, workdir, timeout, ctx.cancel_event, env=ctx.env)
     except OSError as e:
         raise ToolError("cannot run command: %s" % (e.strerror or e))
     out = "exit code: %d\n%s" % (res.returncode, res.output)

@@ -238,7 +238,10 @@ class Agent:
             return _Stop("done")
         attempts = (self.check.attempts if self.check else 0) + 1
         try:
-            res = run_command(self.check_command, str(self.ctx.workdir), self.check_timeout, self.ctx.cancel_event)
+            res = run_command(
+                self.check_command, str(self.ctx.workdir), self.check_timeout, self.ctx.cancel_event,
+                env=self.ctx.env,
+            )
         except OSError as exc:
             self._tool_message(call_id, "Error: cannot run check command: %s" % exc)
             return _Stop("error", error="cannot run check command: %s" % (exc.strerror or exc))

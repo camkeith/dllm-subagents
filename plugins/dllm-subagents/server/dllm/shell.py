@@ -123,11 +123,13 @@ def run_command(
     timeout: float,
     cancel_event: Optional[threading.Event] = None,
     max_output_chars: int = 10_000,
+    env: Optional[Dict[str, str]] = None,
 ) -> CommandResult:
     proc = subprocess.Popen(
         command,
         shell=True,
         cwd=cwd,
+        env=env,
         start_new_session=True,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,

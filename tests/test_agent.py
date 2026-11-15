@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -11,7 +12,7 @@ from dllm.agent import Agent
 from dllm.config import Limits
 from dllm.llm import Completion, LLMError
 from dllm.prompts import SYSTEM_PROMPT
-from dllm.tools import ToolContext
+from dllm.tools import ToolContext, scrubbed_env
 
 from helpers import FakeClient, tool_completion
 
@@ -230,6 +231,15 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(res.status, "check_failed")
         self.assertEqual(res.check.attempts, 3)
         self.assertEqual(res.check.exit_code, 1)
+
+    def test_check_runs_with_scrubbed_env(self):
+        base = dict(os.environ, FOO_API_KEY="secret")
+        self.ctx.env = scrubbed_env(["FOO_API_KEY"], base)
+        script = [finish(), finish(), finish()]
+        self.agent(script, check_command="echo [$FOO_API_KEY]; exit 1").run("task")
+        msg = self.client.calls[1][-1]["content"]
+        self.assertIn("[]", msg)
+        self.assertNotIn("secret", msg)
 
     def test_check_spawn_error_ends_run(self):
         with mock.patch("dllm.agent.run_command", side_effect=OSError("no shell")):
