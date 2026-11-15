@@ -64,6 +64,48 @@ class ApplyEditsTests(unittest.TestCase):
     def test_crlf_in_old_text_also_matches(self):
         self.assertEqual(apply_edits("a\r\nb\r\n", [e("a\r\nb", "A\r\nB")]), "A\r\nB\r\n")
 
+    def test_mixed_line_endings_left_alone(self):
+        self.assertEqual(apply_edits("a\r\nb\nc\n", [e("a", "A")]), "A\r\nb\nc\n")
+        self.assertEqual(apply_edits("a\r\nb\nc\n", [e("b\nc", "B\nC")]), "a\r\nB\nC\n")
+
+    def test_mixed_line_endings_match_across_crlf(self):
+        # Not found exactly: each \n in old_text may match \r\n; new_text uses the matched ending.
+        self.assertEqual(apply_edits("a\r\nb\r\nc\nd\n", [e("a\nb", "A\nB")]), "A\r\nB\r\nc\nd\n")
+        self.assertEqual(apply_edits("x\na\r\nb\r\n", [e("a\nb\n", "A\nB\n")]), "x\nA\r\nB\r\n")
+        with self.assertRaises(EditError) as cm:
+            apply_edits("a\r\nb\nc\na\r\nb\n", [e("a\nb", "X")])
+        self.assertIn("matches 2 times", str(cm.exception))
+        with self.assertRaises(EditError) as cm:
+            apply_edits("a\r\nb\nc\n", [e("a\nz", "X")])
+        self.assertIn("not found", str(cm.exception))
+
+    def test_lf_file_accepts_crlf_old_text(self):
+        self.assertEqual(apply_edits("a\nb\n", [e("a\r\nb", "A\r\nB")]), "A\nB\n")
+
+    def test_lf_file_with_stray_cr_accepts_crlf_old_text(self):
+        # A lone CR (say inside a string literal) does not make the file CRLF.
+        self.assertEqual(apply_edits("a\rb\nc\nd\n", [e("c\r\nd", "C\r\nD")]), "a\rb\nC\nD\n")
+
+    def test_mixed_old_text_starting_with_a_line_break(self):
+        # The \r and the \n of one CRLF are one line break, so one match.
+        self.assertEqual(apply_edits("a\r\nb\nc\n", [e("\nb", "\nB")]), "a\r\nB\nc\n")
+        self.assertEqual(apply_edits("a\nx\r\nfoo\r\nbar\nz\n", [e("\nfoo\nbar", "\nFOO\nBAR")]),
+                         "a\nx\r\nFOO\r\nBAR\nz\n")
+
+    def test_mixed_exact_lf_match_does_not_hide_its_crlf_twin(self):
+        with self.assertRaises(EditError) as cm:
+            apply_edits("f()\r\ng()\r\nX\nf()\ng()\n", [e("f()\ng()", "h()")])
+        self.assertIn("matches 2 times", str(cm.exception))
+
+    def test_mixed_replacement_keeps_each_line_ending(self):
+        self.assertEqual(apply_edits("x\nfoo\r\nbar\nz\n", [e("foo\nbar\n", "FOO\nBAR\n")]),
+                         "x\nFOO\r\nBAR\nz\n")
+        # A different number of line breaks: every one takes the first matched ending.
+        self.assertEqual(apply_edits("x\nfoo\r\nbar\nz\n", [e("foo\nbar\n", "ONE\nTWO\nTHREE\n")]),
+                         "x\nONE\r\nTWO\r\nTHREE\r\nz\n")
+        # The match equals old_text exactly: new_text is kept as given.
+        self.assertEqual(apply_edits("a\r\nb\nc\n", [e("b\nc", "B\r\nC")]), "a\r\nB\r\nC\n")
+
     def test_bom_preserved(self):
         self.assertEqual(apply_edits("\ufeffhello", [e("hello", "bye")]), "\ufeffbye")
 

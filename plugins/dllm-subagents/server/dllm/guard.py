@@ -10,12 +10,15 @@ from __future__ import annotations
 import os
 import re
 import shlex
-from typing import List, Optional, Tuple
+from typing import FrozenSet, List, Optional, Tuple
 
 from .config import config_dir
 
+Cwds = FrozenSet[Optional[str]]  # directories a command segment may run in; None means unknown
+
 KEY_FILE_REASON = "reading the plugin's key file is not allowed"
-READONLY_GIT = frozenset({"status", "diff", "log", "show", "ls-files", "grep", "blame", "rev-parse"})
+READONLY_GIT_COMMANDS = ("status", "diff", "log", "show", "ls-files", "grep", "blame", "rev-parse")
+READONLY_GIT = frozenset(READONLY_GIT_COMMANDS)
 
 _MAX_DEPTH = 6
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
@@ -34,7 +37,7 @@ _WRAPPERS = {
     "xargs": {"-n", "-I", "-L", "-P", "-d", "-E", "-s", "-a", "-l", "-i"},
 }
 _GIT_ARG_OPTS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"})
-_GIT_LIST = "status, diff, log, show, ls-files, grep, blame, rev-parse"
+_GIT_LIST = ", ".join(READONLY_GIT_COMMANDS)
 _ROOTISH = ("/", "~", "$HOME", "${HOME}")
 _PRIV = frozenset({"sudo", "doas"})
 _POWER = frozenset({"reboot", "shutdown", "halt", "poweroff"})
@@ -203,7 +206,7 @@ def _git_subcommand(args: List[str]) -> Optional[str]:
     return None
 
 
-def _rm_reason(args: List[str], workdir: str, cwd: Optional[str]) -> Optional[str]:
+def _rm_reason(args: List[str], workdir: str, cwds: Cwds) -> Optional[str]:
     recursive = False
     targets: List[str] = []
     opts_done = False
@@ -219,23 +222,33 @@ def _rm_reason(args: List[str], workdir: str, cwd: Optional[str]) -> Optional[st
     if not recursive:
         return None
     root = os.path.realpath(workdir)
+    bases = [c for c in cwds if c is not None] or [root]
     for t in targets:
         if t in _ROOTISH or t.startswith("~/") or t.startswith("$HOME/") or t.startswith("${HOME}/") or t == "~":
             return "recursive rm of %s is not allowed (only paths inside the working directory)" % t
         if "$" in t or "`" in t:
             return ("recursive rm of %s is not allowed (a variable or command substitution can expand "
                     "to anything, even to nothing; name the path literally)" % t)
-        if cwd is None and not os.path.isabs(t):
+        if None in cwds and not os.path.isabs(t):
             return "recursive rm of %s is not allowed (the directory after cd is unknown; use paths inside the working directory)" % t
-        path = os.path.realpath(os.path.join(cwd or root, t))
-        if path == root:
-            return "recursive rm of the working directory itself is not allowed (name paths inside it)"
-        if path != root and not path.startswith(root.rstrip(os.sep) + os.sep):
+        outside = 0  # the target must be inside from every directory the rm may run in
+        for base in bases:
+            path = os.path.realpath(os.path.join(base, t))
+            if path == root:
+                return "recursive rm of the working directory itself is not allowed (name paths inside it)"
+            if not path.startswith(root.rstrip(os.sep) + os.sep):
+                outside += 1
+        if outside and outside < len(bases):
+            return ("recursive rm of %s is not allowed (an earlier cd may have failed or gone through a "
+                    "symlink, and then it is outside the working directory; join them with && so rm runs "
+                    "only after the cd worked, as in `cd dir && rm -rf ...`, and do not use `..` after a "
+                    "cd through a symlink, or use `cd -P`)" % t)
+        if outside:
             return "recursive rm of %s is not allowed (only paths inside the working directory)" % t
     return None
 
 
-def _words_reason(words: List[str], workdir: str, depth: int, cwd: Optional[str]) -> Optional[str]:
+def _words_reason(words: List[str], workdir: str, depth: int, cwds: Cwds) -> Optional[str]:
     words = _skip_wrappers(words)
     if not words:
         return None
@@ -254,15 +267,15 @@ def _words_reason(words: List[str], workdir: str, depth: int, cwd: Optional[str]
         if sub is not None and sub not in READONLY_GIT:
             return _git_reason(sub)
     elif cmd == "rm":
-        return _rm_reason(args, workdir, cwd)
+        return _rm_reason(args, workdir, cwds)
     elif cmd in _SHELLS:
         for i, a in enumerate(args):
             if a.startswith("-") and not a.startswith("--") and "c" in a[1:] and i + 1 < len(args):
-                return _check(args[i + 1], workdir, depth + 1, cwd)
+                return _check(args[i + 1], workdir, depth + 1, cwds)
         if "<(" in args and any(os.path.basename(a) in _FETCHERS for a in args[args.index("<(") + 1:]):
             return "running downloaded scripts is not allowed (download to a file and read it first)"
     elif cmd == "eval":
-        return _check(" ".join(args), workdir, depth + 1, cwd)
+        return _check(" ".join(args), workdir, depth + 1, cwds)
     elif cmd == "find":
         for i, a in enumerate(args):
             if a in ("-exec", "-execdir", "-ok", "-okdir"):
@@ -271,27 +284,47 @@ def _words_reason(words: List[str], workdir: str, depth: int, cwd: Optional[str]
                     if b in (";", "+"):
                         break
                     inner.append(b)
-                reason = _words_reason(inner, workdir, depth, cwd)
+                reason = _words_reason(inner, workdir, depth, cwds)
                 if reason:
                     return reason
     return None
 
 
-def _next_cwd(cwd: Optional[str], args: List[str]) -> Optional[str]:
-    """Directory after `cd args`; None when it cannot be known statically."""
+def _next_cwd(cwd: Optional[str], name: str, args: List[str]) -> Optional[FrozenSet[str]]:
+    """Directories `cd`/`pushd`/`popd args` run in cwd may land in; None when it cannot be known
+    statically.
+
+    cd is logical by default: `a/..` drops `a` from the path as typed, even when a is a symlink
+    (bash may also fall back to the physical path), so both results are candidates. With -P
+    (the last of -L and -P wins) symlinks are resolved first, so only the physical one is.
+    """
+    if name == "popd":
+        return None
+    physical = False
+    for a in args:
+        if a in ("-L", "-P"):
+            physical = a == "-P"
     args = [a for a in args if a not in ("-L", "-P", "--")]
     if cwd is None or len(args) != 1:
         return None
     target = args[0]
-    if target == "-" or target.startswith("~") or "$" in target or "`" in target:
+    if target.startswith(("-", "+", "~")) or "$" in target or "`" in target:
         return None
-    return os.path.realpath(os.path.join(cwd, target))
+    joined = os.path.join(cwd, target)
+    if physical:
+        return frozenset({os.path.realpath(joined)})
+    return frozenset({os.path.normpath(joined), os.path.realpath(joined)})
 
 
-def _check(command: str, workdir: str, depth: int, cwd: Optional[str]) -> Optional[str]:
+def _op(sep: str) -> str:
+    """The operator of a separator token, without its parentheses (`);` is `;`)."""
+    return sep.replace("(", "").replace(")", "")
+
+
+def _check(command: str, workdir: str, depth: int, cwds: Cwds) -> Optional[str]:
+    """cwds: every directory the next segment may run in (None: unknown)."""
     if depth > _MAX_DEPTH:
         return _parse_error("nested too deeply")
-    start_cwd = cwd
     text, bodies = _prepare(command)
     try:
         lex = shlex.shlex(text, posix=True, punctuation_chars=True)
@@ -300,20 +333,47 @@ def _check(command: str, workdir: str, depth: int, cwd: Optional[str]) -> Option
         tokens = list(lex)
     except ValueError as exc:
         return _parse_error(str(exc).lower())
+    segs = _segments(tokens)
+    seen = set(cwds)  # every directory any segment may run in, for substitution bodies
+    saved: List[Cwds] = []
+    before_cd: Optional[Cwds] = None  # directories from before `cd x &&`, back after its && chain
     prev_fetch = False
-    for sep, words in _segments(tokens):
-        reason = _words_reason(words, workdir, depth, cwd)
+    for i, (sep, words) in enumerate(segs):
+        if before_cd is not None and (_op(sep) != "&&" or ")" in sep):
+            # The && chain after the cd ended: if the cd failed, the rest runs where it was before.
+            cwds, before_cd = cwds | before_cd, None
+        for ch in sep:  # a cd inside (...) may or may not still apply after it
+            if ch == "(":
+                saved.append(cwds)
+            elif ch == ")" and saved:
+                cwds = cwds | saved.pop()
+        seen |= cwds
+        reason = _words_reason(words, workdir, depth, cwds)
         if reason:
             return reason
         stripped = _skip_wrappers(words)
         name = os.path.basename(stripped[0]) if stripped else ""
-        if name in ("cd", "pushd"):
-            cwd = _next_cwd(cwd, stripped[1:])
+        if name in ("cd", "pushd", "popd"):
+            moved: Cwds = frozenset()
+            for c in cwds:
+                landed = _next_cwd(c, name, stripped[1:])
+                moved |= landed if landed is not None else frozenset({None})
+            after = _op(segs[i + 1][0]) if i + 1 < len(segs) else ""
+            negated = "!" in words[:len(words) - len(stripped)]  # `! cd x && y` runs y if the cd failed
+            # Only `cd x && next` runs next in x for sure (if the cd ran at all: not after || or |),
+            # and only until that && chain ends. After ; || | & or a newline, the cd may have
+            # failed, so next may run in either.
+            if after == "&&" and _op(sep) not in ("||", "|", "|&") and not negated:
+                before_cd = cwds if before_cd is None else before_cd | cwds
+                cwds = moved
+            else:
+                cwds = cwds | moved
+            seen |= cwds
         if prev_fetch and sep in ("|", "|&") and name in _SHELLS:
             return "piping a download into a shell is not allowed (download to a file and read it first)"
         prev_fetch = name in _FETCHERS
     for body in bodies:
-        reason = _check(body, workdir, depth + 1, start_cwd)
+        reason = _check(body, workdir, depth + 1, frozenset(seen))
         if reason:
             return reason
     return None
@@ -326,6 +386,6 @@ def check_command(command: str, workdir: str) -> Optional[str]:
             return _parse_error("not a string")
         if "keys.env" in command or str(config_dir()) in command:
             return KEY_FILE_REASON
-        return _check(command, workdir, 0, os.path.realpath(workdir))
+        return _check(command, workdir, 0, frozenset({os.path.realpath(workdir)}))
     except Exception as exc:  # the guard must never take the run down
         return _parse_error(type(exc).__name__)

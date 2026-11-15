@@ -4,6 +4,7 @@ import threading
 import time
 from typing import Callable, Dict, List, Optional
 
+from dllm.config import DEFAULT_WAIT_SECONDS, HARD_MAX_SECONDS, HARD_MAX_STEPS, HARD_MIN_SECONDS, HARD_MIN_STEPS
 from dllm.mcp import ToolReply, ToolSpec
 from dllm.runs import RunError, render_view
 
@@ -21,8 +22,10 @@ TOOL_SCHEMAS: Dict[str, dict] = {
                 "check_command": {"type": "string", "description": "Command that verifies the work."},
                 "provider": {"type": "string", "description": "Model provider to use."},
                 "model": {"type": "string", "description": "Model name to use."},
-                "max_steps": {"type": "integer", "minimum": 1, "maximum": 150, "description": "Step limit."},
-                "max_seconds": {"type": "integer", "minimum": 10, "maximum": 1800, "description": "Time limit in seconds."},
+                "max_steps": {"type": "integer", "minimum": HARD_MIN_STEPS, "maximum": HARD_MAX_STEPS,
+                              "description": "Step limit."},
+                "max_seconds": {"type": "integer", "minimum": HARD_MIN_SECONDS, "maximum": HARD_MAX_SECONDS,
+                                "description": "Time limit in seconds."},
             },
             "required": ["task"],
         },
@@ -62,7 +65,8 @@ def _wait_and_render(manager, run_id: str, seconds: float, cancel: threading.Eve
     return ToolReply(render_view(view))
 
 
-def build_tool_specs(manager, wait_seconds: float = 50.0, config_error: Optional[str] = None) -> List[ToolSpec]:
+def build_tool_specs(manager, wait_seconds: float = DEFAULT_WAIT_SECONDS,
+                     config_error: Optional[str] = None) -> List[ToolSpec]:
     def fast_agent(args: dict, cancel: threading.Event) -> ToolReply:
         began = time.monotonic()
         files = _arg(args, "files", list)

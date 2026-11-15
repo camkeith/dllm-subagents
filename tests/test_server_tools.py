@@ -2,23 +2,30 @@ from __future__ import annotations
 
 import threading
 import time
+import types
 import unittest
+from unittest import mock
 
+from dllm import server_tools
 from dllm.mcp import ToolReply
 from dllm.runs import RunError
 from dllm.server_tools import build_tool_specs
 
 
 class FakeManager:
-    def __init__(self, start_delay=0.0):
+    def __init__(self, start_delay=0.0, clock=None):
         self.start_delay = start_delay
+        self.clock = clock  # [now]: start() advances it by start_delay instead of sleeping
         self.wait_seconds_seen = None
         self.cancelled = []
         self.start_kwargs = None
 
     def start(self, **kwargs):
         self.start_kwargs = kwargs
-        time.sleep(self.start_delay)
+        if self.clock is not None:
+            self.clock[0] += self.start_delay
+        else:
+            time.sleep(self.start_delay)
         return "20260101-000000-abcdef"
 
     def wait(self, run_id, seconds, interrupt=None):
@@ -39,11 +46,18 @@ def specs(manager, **kwargs):
 
 class ServerToolsTests(unittest.TestCase):
     def test_wait_budget_subtracts_start_time(self):
-        manager = FakeManager(start_delay=0.5)
-        reply = specs(manager, wait_seconds=2.0)["fast_agent"].handler({"task": "t", "workdir": "/x"}, threading.Event())
+        now = [100.0]  # a fake clock: exact, so load cannot move the result
+        manager = FakeManager(start_delay=0.5, clock=now)
+        with mock.patch.object(server_tools, "time", types.SimpleNamespace(monotonic=lambda: now[0])):
+            reply = specs(manager, wait_seconds=2.0)["fast_agent"].handler({"task": "t", "workdir": "/x"},
+                                                                           threading.Event())
         self.assertFalse(reply.is_error)
-        self.assertLess(manager.wait_seconds_seen, 1.6)
-        self.assertGreater(manager.wait_seconds_seen, 1.0)
+        self.assertEqual(manager.wait_seconds_seen, 1.5)
+
+    def test_schema_bounds_match_hard_limits(self):
+        props = server_tools.TOOL_SCHEMAS["fast_agent"]["inputSchema"]["properties"]
+        self.assertEqual((props["max_steps"]["minimum"], props["max_steps"]["maximum"]), (1, 150))
+        self.assertEqual((props["max_seconds"]["minimum"], props["max_seconds"]["maximum"]), (10, 1800))
 
     def test_wait_budget_never_negative(self):
         manager = FakeManager(start_delay=0.2)

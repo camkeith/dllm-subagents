@@ -7,7 +7,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-from dllm.guard import READONLY_GIT, check_command
+from dllm.guard import READONLY_GIT, READONLY_GIT_COMMANDS, check_command
 from dllm.tools import ToolContext, ToolError, run_tool, scrubbed_env
 
 BLOCKED = [
@@ -36,6 +36,8 @@ EXTRA_BLOCKED = [
     "cat <<EOF\nhi\nEOF\ngit push", "cat <<EOF # c\nx\nEOF\ngit push", "echo hi # c\ngit push",
     "cd / && rm -rf *", "cd .. && rm -rf *", "cd ~ && rm -rf .", "cd $X && rm -rf *", "cd sub && rm -rf ..",
     "cd / ; rm -r build", "sh -c 'cd / && rm -rf *'", "cd sub && cd ../.. && rm -rf x", "doas ls", "poweroff",
+    # If sub does not exist the first cd fails, so `cd ..` lands in the parent and rm runs there.
+    "cd sub; cd .. && rm -rf build",
 ]
 EXTRA_ALLOWED = [
     "git", "git rev-parse --show-toplevel", "git ls-files | grep py", "git grep -n push",
@@ -45,7 +47,7 @@ EXTRA_ALLOWED = [
     "cat <<EOF\nit's here\nEOF", "cat <<'EOF' > f\ndon't\nEOF", "git status # comment's",
     "ls; # it's", "cat <<EOF\ngit push\nEOF", "python3 - <<'EOF'\nprint('a')\nrm -rf /\nEOF",
     "cat <<-EOF\n\tgit push\n\tEOF\nls", "cat <<A <<B\nit's\nA\ngit push\nB\nls", "echo $#; echo ${#x}",
-    "cd sub && rm -rf build", "cd sub && rm -rf ./*", "cd sub; cd .. && rm -rf build",
+    "cd sub && rm -rf build", "cd sub && rm -rf ./*", "cd sub && cd .. && rm -rf build",
     "bash script.sh", "VAR=1 python3 -m pytest", "echo 'git push' | cat", "ls > /dev/null 2>&1",
 ]
 
@@ -87,6 +89,9 @@ class GuardTest(unittest.TestCase):
             READONLY_GIT,
             frozenset({"status", "diff", "log", "show", "ls-files", "grep", "blame", "rev-parse"}),
         )
+        reason = check_command("git push", self.workdir)
+        self.assertIn("(only read-only git commands: %s)" % ", ".join(READONLY_GIT_COMMANDS), reason)
+        self.assertEqual(len(READONLY_GIT_COMMANDS), len(READONLY_GIT))
 
     def test_rm_resolves_relative_to_workdir(self):
         self.assertIsNone(check_command("rm -rf sub/../build", self.workdir))
@@ -104,6 +109,54 @@ class GuardTest(unittest.TestCase):
         for cmd in ("rm -rf build", "rm -rf ./dist", "rm $F", "rm -f $F", "cd sub && rm -rf build"):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(check_command(cmd, self.workdir))
+
+    def test_cd_tracks_every_directory_rm_may_run_in(self):
+        # A cd that may fail, or that ran in a subshell, leaves the old directory possible too.
+        for cmd in ("cd nonexistent; rm -rf ../victim", "(cd sub); rm -rf ../victim",
+                    "pushd sub; popd; rm -rf ../victim", "cd sub || rm -rf ../victim",
+                    "true || cd sub && rm -rf ../victim", "cd sub & rm -rf ../victim",
+                    "cd / && echo `rm -rf *`"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(check_command(cmd, self.workdir))
+        for cmd in ("cd sub && rm -rf build", "cd sub; rm -rf build", "rm -rf build",
+                    "(cd sub && rm -rf build); rm -rf dist", "cd sub && pushd lib && rm -rf out"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(check_command(cmd, self.workdir))
+
+    def test_cd_narrowing_ends_with_its_and_chain(self):
+        # `cd x &&` holds only for the && chain after it; a negated cd never narrows.
+        for cmd in ("cd nonexist && true; rm -rf ../b", "cd sub && true || rm -rf ../b",
+                    "! cd missing && rm -rf ../outside", "cd sub && true & rm -rf ../b",
+                    "(cd sub && true); rm -rf ../b"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(check_command(cmd, self.workdir))
+        for cmd in ("cd sub && make && rm -rf build", "cd sub && make; rm -rf build"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(check_command(cmd, self.workdir))
+
+    def test_cd_is_logical_by_default(self):
+        # bash's cd (and pushd) resolve `..` against the path as typed, not the symlink target.
+        os.makedirs(os.path.join(self.workdir, "deep", "dir"))
+        os.symlink(os.path.join("deep", "dir"), os.path.join(self.workdir, "a"))
+        os.makedirs(os.path.join(self.workdir, "x", "y", "z"))
+        os.symlink(os.path.join("x", "y", "z"), os.path.join(self.workdir, "l"))
+        for cmd in ("cd a/.. && rm -rf ../victim", "cd -L a/.. && rm -rf ../victim",
+                    "pushd a/.. && rm -rf ../victim", "cd l && cd ../.. && rm -rf victim"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(check_command(cmd, self.workdir))
+        # -P resolves symlinks first (the last of -L and -P wins), so these stay inside.
+        for cmd in ("cd -P a/.. && rm -rf ../victim", "cd a && rm -rf build", "cd -P a && rm -rf build",
+                    "cd -L -P a/.. && rm -rf ../victim", "cd a && cd .. && rm -rf build",
+                    "cd -P l && cd ../.. && rm -rf victim"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(check_command(cmd, self.workdir))
+
+    def test_failed_cd_reason_suggests_and(self):
+        reason = check_command("cd sub; rm -rf ../b", self.workdir)
+        self.assertIn("an earlier cd may have failed", reason)
+        self.assertIn("&&", reason)
+        # Outside from every possible directory: the plain reason.
+        self.assertIn("only paths inside the working directory", check_command("rm -rf ../b", self.workdir))
 
     def test_tools_use_guard_by_default(self):
         self.assertIs(ToolContext(Path(self.workdir), threading.Event()).guard, check_command)

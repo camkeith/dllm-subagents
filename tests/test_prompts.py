@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
 from dllm.prompts import SYSTEM_PROMPT, build_task_message, load_files
-from dllm.tools import TOOL_SCHEMAS
+from dllm.tools import MAX_FILE_BYTES, TOOL_SCHEMAS
+
+from helpers import call_near_fifo
 
 
 class PromptsTest(unittest.TestCase):
@@ -51,6 +54,22 @@ class PromptsTest(unittest.TestCase):
         files, notes = load_files(self.dir, ["missing.txt", "../x"])
         self.assertEqual(files, [])
         self.assertEqual(len(notes), 2)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs mkfifo")
+    def test_load_files_skips_fifo_and_huge_files(self):
+        fifo = self.dir / "pipe"
+        os.mkfifo(str(fifo))
+        with open(str(self.dir / "big.txt"), "wb") as f:
+            f.truncate(MAX_FILE_BYTES + 1)
+        finished, out, error = call_near_fifo(fifo, lambda: load_files(self.dir, ["pipe", "big.txt"]))
+        self.assertTrue(finished, "load_files blocked on a FIFO")
+        self.assertIsNone(error)
+        files, notes = out
+        self.assertEqual(files, [])
+        self.assertEqual(notes, [
+            "pipe: skipped, is not a regular file",
+            "big.txt: skipped, is %d bytes; over the 10 MB limit, use bash with head/sed" % (MAX_FILE_BYTES + 1),
+        ])
 
     def test_load_files_binary_noted(self):
         (self.dir / "b.bin").write_bytes(b"\x00\x01")

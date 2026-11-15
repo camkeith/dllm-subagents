@@ -26,7 +26,7 @@ def load_files(
     workdir: Path, paths: List[str], max_total_bytes: int = 100_000
 ) -> Tuple[List[Tuple[str, str]], List[str]]:
     # Imported here to keep prompts importable without pulling tool schemas at module load.
-    from .tools import ToolError, resolve_in_workdir
+    from .tools import ToolError, file_problem, resolve_in_workdir
 
     files: List[Tuple[str, str]] = []
     notes: List[str] = []
@@ -34,6 +34,10 @@ def load_files(
     for rel in paths:
         try:
             path = resolve_in_workdir(workdir, rel)
+            problem = file_problem(path)
+            if problem:
+                notes.append("%s: skipped, %s" % (rel, problem))
+                continue
             data = path.read_bytes()
         except ToolError:
             notes.append("%s: skipped, outside the working directory" % rel)

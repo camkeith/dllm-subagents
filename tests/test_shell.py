@@ -113,10 +113,14 @@ class RunCommandTests(unittest.TestCase):
 
     def test_quick_command_returns_quickly(self):
         run_command("true", os.getcwd(), 10)  # warm up
-        start = time.monotonic()
+        times = []
         for _ in range(10):
+            start = time.monotonic()
             run_command("true", os.getcwd(), 10)
-        self.assertLess((time.monotonic() - start) / 10, 0.030)
+            times.append(time.monotonic() - start)
+        # The fastest run, not the mean: a few slow runs under load do not fail it, while a
+        # fixed 50 ms poll makes every run slower than 30 ms.
+        self.assertLess(min(times), 0.030)
 
     def test_cwd(self):
         with tempfile.TemporaryDirectory() as d:

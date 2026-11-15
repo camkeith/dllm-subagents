@@ -1,8 +1,10 @@
 """The tools the fast subagent can call, and their OpenAI function schemas."""
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
+import stat
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +17,7 @@ from .shell import CUT_MARKER_RE, run_command
 READ_DEFAULT_LIMIT = 2000
 READ_MAX_LINE_CHARS = 2000
 LINE_CUT_MARKER = "... [line cut]"
+MAX_FILE_BYTES = 10 * 1024 * 1024
 
 
 def _tool(name: str, description: str, properties: dict, required: list) -> dict:
@@ -97,6 +100,39 @@ def scrubbed_env(names: Iterable[str], base: Optional[Mapping[str, str]] = None)
     return {k: v for k, v in (os.environ if base is None else base).items() if k not in drop}
 
 
+_ALWAYS_PASSED = frozenset({"PATH", "HOME", "USER", "SHELL", "LANG", "TERM", "TMPDIR", "PWD"})  # and LC_*
+_AWS_NOT_SECRET = frozenset({"AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE"})
+_SECRET_NAME_PATTERNS = (
+    "*_API_KEY", "*_APIKEY", "*_TOKEN", "*_SECRET", "*_SECRET_*", "*SECRET_KEY*", "*PASSWORD*", "*_PASS",
+    "*_KEY", "*CREDENTIAL*", "*_DSN", "*_PWD", "*PASSPHRASE*", "*_PAT", "*_AUTH",
+    "AWS_*", "ANTHROPIC_*", "OPENAI_*", "GITHUB_TOKEN", "GH_TOKEN", "SSH_AUTH_SOCK",
+)
+_SHELL_HOOK_NAMES = frozenset({"CDPATH", "ENV", "BASH_ENV"})  # change where cd goes or what a shell runs
+_URL_WITH_PASSWORD = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]*:[^/\s@]+@")  # scheme://user:pw@
+
+
+def _secret_looking(name: str, value: str) -> bool:
+    upper = name.upper()
+    if upper in _AWS_NOT_SECRET:
+        return False
+    return (upper in _SHELL_HOOK_NAMES or any(fnmatch.fnmatchcase(upper, p) for p in _SECRET_NAME_PATTERNS)
+            or _URL_WITH_PASSWORD.search(value) is not None)
+
+
+def run_env(secret_names: Iterable[str], pass_env: Iterable[str] = (),
+            base: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
+    """The environment for the subagent's bash and check commands: base (default os.environ)
+    without the provider key variables (always), and without secret-looking variables (tokens,
+    keys, passwords, credentials, cloud settings, URLs holding a password, CDPATH/ENV/BASH_ENV)
+    unless pass_env names them. PATH, HOME, USER, SHELL, LANG, LC_*, TERM, TMPDIR and PWD are
+    always passed."""
+    allowed = set(pass_env)
+    return {
+        k: v for k, v in scrubbed_env(secret_names, base).items()
+        if k in _ALWAYS_PASSED or k.startswith("LC_") or k in allowed or not _secret_looking(k, v)
+    }
+
+
 REDACT_MIN_CHARS = 8
 
 
@@ -170,9 +206,33 @@ def _arg(args: dict, key: str, typ, required: bool = True):
     return value
 
 
+def file_problem(path: Path) -> Optional[str]:
+    """Why the file tools will not open path (a FIFO would block, a huge file would flood
+    memory), or None. Raises OSError if path cannot be stat'ed."""
+    st = os.stat(str(path))
+    if stat.S_ISDIR(st.st_mode):
+        return "is a directory"
+    if not stat.S_ISREG(st.st_mode):
+        return "is not a regular file"
+    if st.st_size > MAX_FILE_BYTES:
+        return "is %d bytes; over the %d MB limit, use bash with head/sed" % (
+            st.st_size, MAX_FILE_BYTES // (1024 * 1024))
+    return None
+
+
+def _check_file(path: Path, display: str) -> None:
+    try:
+        problem = file_problem(path)
+    except FileNotFoundError:
+        raise ToolError("file not found: %s" % display)
+    except OSError as e:
+        raise ToolError("cannot read %s: %s" % (display, e.strerror or e))
+    if problem:
+        raise ToolError("%s %s" % (display, problem))
+
+
 def _read_text(path: Path, display: str) -> str:
-    if path.is_dir():
-        raise ToolError("%s is a directory" % display)
+    _check_file(path, display)
     try:
         data = path.read_bytes()
     except FileNotFoundError:
@@ -218,8 +278,16 @@ def _write(args: dict, ctx: ToolContext) -> str:
     display = _arg(args, "path", str)
     content = _arg(args, "content", str)
     path = resolve_in_workdir(ctx.workdir, display, for_write=True)
-    if path.is_dir():
+    try:
+        st = os.stat(str(path))
+    except FileNotFoundError:
+        st = None
+    except OSError as e:
+        raise ToolError("cannot write %s: %s" % (display, e.strerror or e))
+    if st is not None and stat.S_ISDIR(st.st_mode):
         raise ToolError("%s is a directory" % display)
+    if st is not None and not stat.S_ISREG(st.st_mode):  # opening a FIFO would block
+        raise ToolError("%s is not a regular file" % display)
     data = content.encode("utf-8")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -233,6 +301,7 @@ def _edit(args: dict, ctx: ToolContext) -> str:
     display = _arg(args, "path", str)
     edits = _arg(args, "edits", list)
     path = resolve_in_workdir(ctx.workdir, display, for_write=True)
+    _check_file(path, display)
     try:
         content = path.read_bytes().decode("utf-8")
     except FileNotFoundError:

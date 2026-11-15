@@ -21,7 +21,7 @@ from .agent import Agent, AgentResult
 from .config import ConfigError, Profile, Settings, clamp_limits, resolve_api_key
 from .llm import ChatClient
 from .prompts import build_task_message, load_files
-from .tools import ToolContext, redact, scrubbed_env
+from .tools import ToolContext, redact, run_env
 
 CANCEL_WAIT_SECONDS = 5.0
 SHUTDOWN_GRACE_SECONDS = 5.0
@@ -30,6 +30,7 @@ PASSED_CHECK_TAIL_LINES = 5
 SUMMARY_MAX_CHARS = 4_000
 MAX_LISTED_FILES = 100
 MAX_GROUP_LINES = 20
+MAX_LISTED_NESTED = 10
 _POLL = 0.05
 _RUN_ID = re.compile(r"\d{8}-\d{6}-[0-9a-f]{6}")
 _UNDO_OWNER = "undo:"
@@ -63,8 +64,11 @@ class RunRecord:
     provider: str
     model: str
     undone: bool = False
-    ignored: List[str] = field(default_factory=list)  # ignored at before-time; excluded and protected
+    # Ignored paths and nested git repositories at before-time (raw, not redacted): excluded from
+    # the after-snapshot and protected from undo.
+    ignored: List[str] = field(default_factory=list)
     error: Optional[str] = None
+    nested: List[str] = field(default_factory=list)  # untracked nested git repositories, not snapshotted
 
     def save(self, path: Path) -> None:
         path = Path(path)
@@ -142,6 +146,10 @@ def _default_workdir() -> Optional[str]:
     return cwd
 
 
+def _merged(first: List[str], second: List[str]) -> List[str]:
+    return first + [p for p in second if p not in first]
+
+
 def _new_run_id() -> str:
     return time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
 
@@ -189,6 +197,7 @@ class RunManager:
         self._client_factory = client_factory or (
             lambda profile, key, model: ChatClient(profile, key, model=model)
         )
+        snapshot.set_secret_env_names(p.api_key_env for p in settings.profiles.values())
         self._lock = threading.Lock()
         self._runs: Dict[str, _Run] = {}
         self._active: Dict[str, str] = {}  # resolved repo root -> owner
@@ -256,17 +265,19 @@ class RunManager:
         lock = self._acquire(repo, run_id)
         run: Optional[_Run] = None
         try:
-            before = snapshot.snapshot_tree(repo)
-            ignored = snapshot.ignored_paths(repo)
+            before, nested = snapshot.take_snapshot(repo)
+            # A nested repo stays out even if the run deletes its .git, or undo would delete its files.
+            ignored = _merged(snapshot.ignored_paths(repo), nested)
             record = RunRecord(
                 run_id=run_id, workdir=workdir, repo=lock.key, before_tree=before, after_tree=None,
                 status="running", started_at=time.time(), ended_at=None, provider=name,
                 model=model or profile.model, ignored=ignored,
+                nested=[redact(p, known_keys) for p in nested],
             )
             run = _Run(record, directory, lock)
             record.save(run.record_path)
             ctx = ToolContext(workdir=Path(workdir), cancel_event=run.cancel_event,
-                              env=scrubbed_env(secret_names))
+                              env=run_env(secret_names, self.settings.pass_env))
             agent = Agent(client, ctx, limits, check_command=check_command,
                           on_step=run.on_step, trajectory_path=run.log_path, redact=known_keys)
             thread = threading.Thread(target=self._work, args=(run, agent, message),
@@ -363,7 +374,8 @@ class RunManager:
             self._release(lock)
         if record.before_tree == record.after_tree:
             return "Run %s made no changes; nothing to undo." % run_id
-        return "Undid run %s: the files it changed are back to how they were before it started." % run_id
+        return ("Undid run %s: the files it changed are back to how they were before it started "
+                "(line endings follow your git settings)." % run_id)
 
     def shutdown(self) -> None:
         with self._lock:
@@ -433,8 +445,9 @@ class RunManager:
         status = result.status if result is not None else "error"
         errors = [e for e in ((result.error if result is not None else crash),) if e]
         after: Optional[str] = None
+        nested: List[str] = []
         try:
-            after = snapshot.snapshot_tree(repo, exclude=rec.ignored)
+            after, nested = snapshot.take_snapshot(repo, exclude=rec.ignored, keep_from=rec.before_tree)
         except Exception as exc:
             status = "error"
             errors.append("could not snapshot the working tree after the run: %s" % exc)
@@ -447,7 +460,10 @@ class RunManager:
                                                                redact=keys)
             except Exception as exc:
                 errors.append("could not compute the diff: %s" % exc)
+        if changes is not None:  # a file may be named after a key
+            changes = [dataclasses.replace(c, path=redact(c.path, keys)) for c in changes]
         with run.save_lock:
+            rec.nested = _merged(rec.nested, [redact(p, keys) for p in nested])
             rec.after_tree = after
             rec.status = status
             rec.ended_at = time.time()
@@ -485,6 +501,7 @@ class RunManager:
             "log_path": str(run.log_path),
             "before_tree": rec.before_tree,
             "after_tree": rec.after_tree,
+            "nested": list(rec.nested),
         }
 
     def _save_stuck(self, run: _Run) -> None:
@@ -493,7 +510,7 @@ class RunManager:
         after: Optional[str] = None
         error = "the server shut down before the run stopped"
         try:
-            after = snapshot.snapshot_tree(Path(rec.repo), exclude=rec.ignored)
+            after = snapshot.snapshot_tree(Path(rec.repo), exclude=rec.ignored, keep_from=rec.before_tree)
         except Exception as exc:
             error += "; could not snapshot the working tree after the run: %s" % exc
         with run.save_lock:
@@ -624,6 +641,13 @@ def render_view(view: dict) -> str:
     else:
         lines.append("changed files: none. Files ignored by git (for example through .gitignore) "
                      "are not tracked, so changes to them are not shown.")
+    nested = view.get("nested") or []
+    if nested:
+        names = ", ".join(nested[:MAX_LISTED_NESTED])
+        if len(nested) > MAX_LISTED_NESTED:
+            names += " and %d more" % (len(nested) - MAX_LISTED_NESTED)
+        lines.append("not tracked: nested git %s %s (changes inside are not in this diff, and undo "
+                     "does not revert them)" % ("repository" if len(nested) == 1 else "repositories", names))
     if view.get("log_path"):
         lines.append("log: %s" % view["log_path"])
     if changes and view.get("after_tree"):

@@ -11,6 +11,8 @@ from dllm import tools
 from dllm.shell import CommandResult
 from dllm.tools import ToolContext, ToolError, resolve_in_workdir, run_tool
 
+from helpers import call_near_fifo
+
 
 class ToolsTest(unittest.TestCase):
     def setUp(self):
@@ -43,6 +45,49 @@ class ToolsTest(unittest.TestCase):
             run_tool("read", {"path": "b.bin"}, self.ctx)
         self.assertIn("binary", str(cm.exception))
         self.assertIn("50", str(cm.exception))
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs mkfifo")
+    def test_fifo_refused_without_blocking(self):
+        fifo = self.workdir / "pipe"
+        os.mkfifo(str(fifo))
+        calls = (("read", {"path": "pipe"}),
+                 ("edit", {"path": "pipe", "edits": [{"old_text": "a", "new_text": "b"}]}))
+        for name, args in calls:
+            with self.subTest(tool=name):
+                finished, _, error = call_near_fifo(fifo, lambda n=name, a=args: run_tool(n, a, self.ctx))
+                self.assertTrue(finished, "%s blocked on a FIFO" % name)
+                self.assertIsInstance(error, ToolError)
+                self.assertIn("pipe is not a regular file", str(error))
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs mkfifo")
+    def test_write_refuses_fifo_without_blocking(self):
+        fifo = self.workdir / "pipe"
+        os.mkfifo(str(fifo))
+        finished, _, error = call_near_fifo(
+            fifo, lambda: run_tool("write", {"path": "pipe", "content": "x"}, self.ctx))
+        self.assertTrue(finished, "write blocked on a FIFO")
+        self.assertIsInstance(error, ToolError)
+        self.assertIn("pipe is not a regular file", str(error))
+
+    def test_size_limit_message_follows_the_constant(self):
+        with open(str(self.workdir / "big.log"), "wb") as f:
+            f.truncate(1024 * 1024 + 1)
+        with mock.patch.object(tools, "MAX_FILE_BYTES", 1024 * 1024):
+            with self.assertRaises(ToolError) as cm:
+                run_tool("read", {"path": "big.log"}, self.ctx)
+        self.assertIn("over the 1 MB limit", str(cm.exception))
+
+    def test_oversize_file_refused(self):
+        with open(str(self.workdir / "big.log"), "wb") as f:
+            f.truncate(tools.MAX_FILE_BYTES + 1)  # sparse: no real disk use
+        calls = (("read", {"path": "big.log"}),
+                 ("edit", {"path": "big.log", "edits": [{"old_text": "a", "new_text": "b"}]}))
+        for name, args in calls:
+            with self.subTest(tool=name):
+                with self.assertRaises(ToolError) as cm:
+                    run_tool(name, args, self.ctx)
+                self.assertIn("big.log is %d bytes; over the 10 MB limit, use bash with head/sed"
+                              % (tools.MAX_FILE_BYTES + 1), str(cm.exception))
 
     def test_read_missing_file(self):
         with self.assertRaises(ToolError) as cm:
@@ -179,6 +224,50 @@ class ToolsTest(unittest.TestCase):
         with self.assertRaises(ToolError) as cm:
             run_tool("read", {}, self.ctx)
         self.assertIn("path", str(cm.exception))
+
+
+class RunEnvTest(unittest.TestCase):
+    BASE = {
+        "PATH": "/bin", "HOME": "/h", "USER": "u", "SHELL": "/bin/sh", "LANG": "C", "LC_ALL": "C",
+        "TERM": "xterm", "TMPDIR": "/t", "PWD": "/w", "EDITOR": "vi",
+        "AWS_REGION": "r", "AWS_DEFAULT_REGION": "r", "AWS_PROFILE": "p",
+        "AWS_SECRET_ACCESS_KEY": "s", "AWS_ACCESS_KEY_ID": "i", "GITHUB_TOKEN": "g", "GH_TOKEN": "g",
+        "MY_API_KEY": "k", "my_apikey": "k", "DB_PASSWORD": "p", "DB_PASS": "p", "STRIPE_SECRET": "s",
+        "X_SECRET_Y": "s", "SECRET_KEY_BASE": "s", "NPM_TOKEN": "n", "ANTHROPIC_BASE_URL": "a",
+        "OPENAI_ORG": "o", "CDPATH": "/", "ENV": "/e", "BASH_ENV": "/b", "PROVIDER_KEY": "k",
+    }
+    KEPT = ("PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "TERM", "TMPDIR", "PWD", "EDITOR",
+            "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE")
+
+    def test_drops_secret_looking_variables(self):
+        env = tools.run_env(["PROVIDER_KEY"], base=self.BASE)
+        self.assertEqual(sorted(env), sorted(self.KEPT))
+
+    def test_drops_keys_credentials_dsns_and_urls_with_passwords(self):
+        dropped = {
+            "AZURE_OPENAI_KEY": "k", "DD_APP_KEY": "k", "GOOGLE_CREDENTIALS": "c", "SENTRY_DSN": "d",
+            "MYSQL_PWD": "p", "SSH_AUTH_SOCK": "/s", "DATABASE_URL": "postgres://u:p@h/db",
+            "GPG_PASSPHRASE": "p", "AZURE_DEVOPS_EXT_PAT": "p", "NPM_CONFIG__AUTH": "a",
+            "npm_config__auth": "a", "MINIO_ACCESS_KEY": "k", "JWT_PRIVATE_KEY": "k",
+            "REDIS": "redis://:hunter2@cache:6379",
+        }
+        kept = {"CACHE_URL": "postgres://h/db", "PWD": "/w", "OLDPWD": "/o", "PATH": "/bin",
+                "CLASSPATH": "/c", "GOPATH": "/g", "PROXY": "http://user@proxy:8080/", "SITE": "https://h:8443/x"}
+        env = tools.run_env([], base=dict(dropped, **kept))
+        self.assertEqual(env, kept)
+        self.assertEqual(tools.run_env([], base={"DATABASE_URL": "postgres://h/db"}), {"DATABASE_URL": "postgres://h/db"})
+
+    def test_pass_env_keeps_a_url_with_a_password(self):
+        env = tools.run_env([], pass_env=["DATABASE_URL"], base={"DATABASE_URL": "postgres://u:p@h/db"})
+        self.assertEqual(env, {"DATABASE_URL": "postgres://u:p@h/db"})
+        # An always-passed name wins too.
+        self.assertEqual(tools.run_env([], base={"PATH": "x://u:p@h/"}), {"PATH": "x://u:p@h/"})
+
+    def test_pass_env_keeps_named_variables_but_never_provider_keys(self):
+        env = tools.run_env(["PROVIDER_KEY"], pass_env=["NPM_TOKEN", "PROVIDER_KEY"], base=self.BASE)
+        self.assertEqual(env["NPM_TOKEN"], "n")
+        self.assertNotIn("PROVIDER_KEY", env)
+        self.assertNotIn("GITHUB_TOKEN", env)
 
 
 if __name__ == "__main__":

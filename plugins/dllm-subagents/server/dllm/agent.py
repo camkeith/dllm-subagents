@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Callable, List, Optional, Sequence
 
 from .config import Limits
-from .llm import LLMError
+from .llm import DeadlineReached, LLMError
 from .prompts import SYSTEM_PROMPT
 from .shell import run_command, truncate_middle
 from .tools import TOOL_SCHEMAS, ToolContext, ToolError, run_tool, scrub_cuts
@@ -56,11 +56,13 @@ class AgentResult:
 class _Stop(Exception):
     """Control flow: ends the run with the given status."""
 
-    def __init__(self, status: str, *, limit: Optional[str] = None, error: Optional[str] = None):
+    def __init__(self, status: str, *, limit: Optional[str] = None, error: Optional[str] = None,
+                 check_cut: bool = False):
         super().__init__(status)
         self.status = status
         self.limit = limit
         self.error = error
+        self.check_cut = check_cut  # the run's time limit cut the check short: not a check failure
 
 
 def _label(name: str, args: dict, scrub: Callable[[str], str]) -> str:
@@ -143,8 +145,13 @@ class Agent:
         self.steps += 1
         deadline = self._start + self.limits.max_seconds
         try:
-            completion = self.client.complete(self.messages, TOOL_SCHEMAS, deadline)
+            completion = self.client.complete(self.messages, TOOL_SCHEMAS, deadline,
+                                              cancel=self.ctx.cancel_event)
         except LLMError as exc:
+            if self.ctx.cancel_event.is_set():  # cancelled while waiting to retry
+                raise _Stop("cancelled")
+            if isinstance(exc, DeadlineReached):  # the run's time ran out, not a provider failure
+                raise _Stop("limit_reached", limit="max_seconds", error=str(exc))
             raise _Stop("error", error=str(exc))
         self.input_tokens += completion.input_tokens
         self.output_tokens += completion.output_tokens
@@ -286,6 +293,9 @@ class Agent:
         if res.cancelled:
             self._tool_message(call_id, "The check was cancelled.")
             return _Stop("cancelled")
+        if res.timed_out and timeout < self.check_timeout:
+            self._tool_message(call_id, "The run's time limit was reached while the check was running.")
+            return _Stop("limit_reached", limit="max_seconds", check_cut=True)
         if res.returncode == 0 and not res.timed_out:
             self._tool_message(call_id, "Check passed. Finished.")
             return _Stop("done")
@@ -307,7 +317,8 @@ class Agent:
 
     def _finish_run(self, stop: _Stop) -> AgentResult:
         status = stop.status
-        if status == "limit_reached" and self.check is not None and self.check.exit_code != 0:
+        if (status == "limit_reached" and not stop.check_cut and self.check is not None
+                and self.check.exit_code != 0):
             status = "check_failed"
         self._status = status
         self._save()
@@ -345,5 +356,5 @@ class Agent:
         }
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps(data, indent=2))
+        tmp.write_text(json.dumps(data))
         os.replace(str(tmp), str(path))

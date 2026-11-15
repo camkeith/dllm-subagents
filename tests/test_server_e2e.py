@@ -19,6 +19,13 @@ SCRIPT = os.path.join(SERVER_DIR, "fast_agent_server.py")
 KEY = "sk-e2e-fake-key-123"
 
 
+def _kill_quietly(pid):
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def tool_message(*calls, content=None):
     wire = [
         {"id": "call_%d" % i, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
@@ -206,19 +213,20 @@ class ServerE2ETests(E2EBase):
         self.assertNotIn(KEY, text)
 
     def test_wait_path(self):
+        delay = 6  # the provider's first reply; wait_seconds is 2
         fake = self.provider([
-            (tool_message(("write", {"path": "slow.txt", "content": "x\n"})), 3),
+            (tool_message(("write", {"path": "slow.txt", "content": "x\n"})), delay),
             (tool_message(("finish", {"summary": "slow done"})), 0),
         ])
         self.write_config(fake.base_url)
         self.start_server()
         started = time.monotonic()
         text, is_error = self.call("fast_agent", {"task": "slow job", "workdir": str(self.repo)})
-        self.assertLess(time.monotonic() - started, 3.5)
+        self.assertLess(time.monotonic() - started, delay - 1)  # returned before the provider did
         self.assertFalse(is_error)
         self.assertIn("status: running", text)
         run_id = self.run_id_from(text)
-        for _ in range(4):
+        for _ in range(10):
             text, is_error = self.call("fast_agent_wait", {"run_id": run_id})
             if "status: running" not in text:
                 break
@@ -238,8 +246,14 @@ class ServerE2ETests(E2EBase):
         time.sleep(0.3)
         self.pipe.send({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": msg_id}})
         self.assertIsNone(self.pipe.read(1.0), "a cancelled call must not get a response")
-        text, is_error = self.call("fast_agent_wait", {"run_id": run_id}, timeout=15)
-        self.assertFalse(is_error, text)
+        # Poll for the outcome instead of betting on one 2 s wait: under load the run may still be
+        # in its (3 s) model call. A run the cancel did not reach ends "done" and writes late.txt.
+        deadline = time.monotonic() + 15
+        while True:
+            text, is_error = self.call("fast_agent_wait", {"run_id": run_id}, timeout=15)
+            self.assertFalse(is_error, text)
+            if "status: running" not in text or time.monotonic() > deadline:
+                break
         self.assertIn("status: cancelled", text)
         self.assertFalse((self.repo / "late.txt").exists())
 
@@ -291,7 +305,7 @@ class ServerE2ETests(E2EBase):
         self.assertTrue(is_error)
         self.assertIn("Invalid JSON", text)
 
-    def test_sigterm_kills_children(self):
+    def _assert_signal_stops_run(self, signum):
         pidfile = Path(self.tmp) / "sleep.pid"
         fake = self.provider([
             (tool_message(("bash", {"command": "echo $$ > %s; exec sleep 30" % pidfile})), 0),
@@ -304,13 +318,37 @@ class ServerE2ETests(E2EBase):
             time.sleep(0.05)
         self.assertTrue(pidfile.exists(), "the bash command never started")
         sleeper = int(pidfile.read_text().strip())
-        os.kill(proc.pid, signal.SIGTERM)
+        self.addCleanup(_kill_quietly, sleeper)
+        run_id = self.run_id_on_disk()
+        os.kill(proc.pid, signum)
         started = time.monotonic()
         proc.wait(5)
         self.assertLess(time.monotonic() - started, 5)
         time.sleep(0.2)
         with self.assertRaises(ProcessLookupError):
             os.kill(sleeper, 0)
+        record = json.loads((self.runs_dir / (run_id + ".json")).read_text())
+        self.assertEqual(record["status"], "cancelled")
+
+    def test_sigterm_kills_children(self):
+        self._assert_signal_stops_run(signal.SIGTERM)
+
+    def test_sighup_kills_children(self):
+        self._assert_signal_stops_run(signal.SIGHUP)
+
+    @unittest.skipUnless(hasattr(signal, "SIGQUIT"), "no SIGQUIT on this platform")
+    def test_sigquit_kills_children(self):
+        self._assert_signal_stops_run(signal.SIGQUIT)
+
+    def test_bad_config_type_still_serves_and_reports(self):
+        # QA replay: {"wait_seconds": "abc"} used to crash the server at startup.
+        self.write_config("http://127.0.0.1:9/v1", config_text='{"wait_seconds": "abc"}')
+        self.start_server()  # initialize is answered
+        tools = self.rpc("tools/list")["result"]["tools"]
+        self.assertEqual(len(tools), 4)
+        text, is_error = self.call("fast_agent", {"task": "x", "workdir": str(self.repo)})
+        self.assertTrue(is_error)
+        self.assertIn("wait_seconds", text)
 
     def test_eof_exits_cleanly(self):
         self.write_config(self.provider([]).base_url)

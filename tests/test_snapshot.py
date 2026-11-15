@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -9,6 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from dllm import snapshot as snap
 from dllm.snapshot import (
     FileChange,
     SnapshotError,
@@ -19,7 +21,7 @@ from dllm.snapshot import (
     snapshot_tree,
     undo,
 )
-from helpers import isolated_git_env, make_repo
+from helpers import call_near_fifo, isolated_git_env, make_repo
 
 
 def run_git(repo, *args):
@@ -191,6 +193,19 @@ class SnapshotTests(unittest.TestCase):
         self.assertIn("a.txt", str(cm.exception))
         self.assertEqual((repo / "a.txt").read_text(), "totally different\n")
 
+    def test_undo_conflict_names_every_file(self):
+        repo = make_repo(self.tmp)
+        (repo / "c.txt").write_text("c\n")
+        before = snapshot_tree(repo)
+        for name in ("a.txt", "b.txt", "c.txt"):
+            (repo / name).unlink()
+        after = snapshot_tree(repo)
+        for name in ("a.txt", "b.txt", "c.txt"):
+            (repo / name).write_text("recreated by the user\n")
+        with self.assertRaises(SnapshotError) as cm:
+            undo(repo, before, after)
+        self.assertIn("conflicting files: a.txt, b.txt, c.txt", str(cm.exception))
+
     def test_undo_after_gc_pruned_snapshots(self):
         repo = make_repo(self.tmp)
         before = snapshot_tree(repo)
@@ -237,13 +252,318 @@ class SnapshotTests(unittest.TestCase):
         self.assertFalse((sub / "x.txt").exists())
         self.assertEqual(git_path(repo, "index").read_bytes(), main_index)
 
-    def test_embedded_repo_is_gitlink(self):
+    def test_embedded_repo_is_left_out(self):
         repo = make_repo(self.tmp)
         inner = make_repo(os.path.join(self.tmp, "x"))
         shutil.move(str(inner), str(repo / "vendored"))
-        sha = snapshot_tree(repo)
-        out = run_git(repo, "ls-tree", sha, "vendored").decode()
-        self.assertTrue(out.startswith("160000 commit"), out)
+        sha, nested = snap.take_snapshot(repo)
+        self.assertEqual(run_git(repo, "ls-tree", sha, "vendored"), b"")
+        self.assertEqual(nested, ["vendored/"])
+
+    def test_nested_repo_without_commit(self):
+        repo = make_repo(self.tmp)
+        before, nested = snap.take_snapshot(repo)
+        self.assertEqual(nested, [])
+        lib = repo / "tools" / "lib"  # inside an untracked directory, so found at any depth
+        lib.mkdir(parents=True)
+        run_git(lib, "init", "-q")
+        (lib / "f.txt").write_text("x\n")
+        (repo / "tools" / "cli.py").write_text("print(1)\n")
+        after, nested = snap.take_snapshot(repo, keep_from=before)
+        self.assertEqual(nested, ["tools/lib/"])
+        self.assertEqual([c.path for c in diff_trees(repo, before, after)[0]], ["tools/cli.py"])
+        undo(repo, before, after)
+        self.assertFalse((repo / "tools" / "cli.py").exists())
+        self.assertEqual((lib / "f.txt").read_text(), "x\n")
+
+    def test_nested_repo_left_out_despite_gitignore_negation(self):
+        # `!*/` beats a core.excludesFile pattern, so the exclusion must be a pathspec.
+        repo = make_repo(self.tmp)
+        (repo / ".gitignore").write_text("*\n!*/\n!*.txt\n!.gitignore\n")
+        sub = repo / "sub"
+        sub.mkdir()
+        run_git(sub, "init", "-q")
+        (sub / "x.txt").write_text("x\n")
+        sha, nested = snap.take_snapshot(repo)
+        self.assertEqual(nested, ["sub/"])
+        self.assertEqual(run_git(repo, "ls-tree", sha, "sub"), b"")
+        # After the run, as RunManager does: the before-time nested repo is in exclude too.
+        (repo / "new.txt").write_text("n\n")
+        after, _ = snap.take_snapshot(repo, exclude=ignored_paths(repo) + nested, keep_from=sha)
+        self.assertEqual([c.path for c in diff_trees(repo, sha, after)[0]], ["new.txt"])
+
+    def test_directory_that_becomes_a_nested_repo_keeps_its_files(self):
+        repo = make_repo(self.tmp)
+        (repo / "proj").mkdir()
+        (repo / "proj" / "a.txt").write_text("a\n")
+        (repo / "other.txt").write_text("before\n")
+        before = snapshot_tree(repo)
+        ign = ignored_paths(repo)
+        (repo / "other.txt").write_text("after\n")
+        run_git(repo / "proj", "init", "-q")  # during the run, proj becomes a nested repository
+        after, nested = snap.take_snapshot(repo, exclude=ign, keep_from=before)
+        self.assertEqual(nested, ["proj/"])
+        self.assertEqual([c.path for c in diff_trees(repo, before, after)[0]], ["other.txt"])
+        undo(repo, before, after, protect=ign)
+        self.assertEqual((repo / "other.txt").read_text(), "before\n")
+        self.assertEqual((repo / "proj" / "a.txt").read_text(), "a\n")
+
+    def test_nested_repo_under_before_ignored_dir(self):
+        # A `!build/` rule outranks core.excludesFile, so add -A walks build/ and meets build/x.
+        for i, (gitignore, changed) in enumerate((("build/\n!build/\n", {"a.txt", ".gitignore"}),
+                                                  ("build/\n", {"a.txt"}))):
+            with self.subTest(gitignore=gitignore):
+                repo = make_repo(os.path.join(self.tmp, "case%d" % i))
+                (repo / ".gitignore").write_text("build/\n")
+                run_git(repo, "add", ".gitignore")
+                run_git(repo, "commit", "-q", "-m", "ign")
+                (repo / "build").mkdir()
+                (repo / "build" / "o.bin").write_text("o\n")
+                before, _ = snap.take_snapshot(repo)
+                ign = ignored_paths(repo)
+                self.assertEqual(ign, ["build/"])
+                (repo / ".gitignore").write_text(gitignore)
+                inner = repo / "build" / "x"
+                inner.mkdir()
+                run_git(inner, "init", "-q")
+                (inner / "f.txt").write_text("f\n")
+                (repo / "a.txt").write_text("changed\n")
+                after, _ = snap.take_snapshot(repo, exclude=ign, keep_from=before)
+                self.assertEqual(run_git(repo, "ls-tree", "-r", "--name-only", after, "build"), b"")
+                self.assertEqual({c.path for c in diff_trees(repo, before, after)[0]}, changed)
+                undo(repo, before, after, protect=ign)
+                self.assertEqual((repo / "a.txt").read_text(), "one\ntwo\nthree\n")
+                self.assertEqual((repo / ".gitignore").read_text(), "build/\n")
+                self.assertEqual((inner / "f.txt").read_text(), "f\n")
+                self.assertTrue((inner / ".git").is_dir())
+                self.assertEqual((repo / "build" / "o.bin").read_text(), "o\n")
+
+    def test_ignored_path_replaced_by_dir_holding_nested_repo(self):
+        # The ignored file or symlink `build` becomes a directory, build/x a nested repo with no
+        # commit, and the run drops the rule. The excludes file still ignores /build for add -A,
+        # so naming build/x in an exclude pathspec too would make git add fail.
+        for i, (kind, nested_at) in enumerate((("file", "build/x"), ("symlink", "build/x"),
+                                               ("file", "build"))):
+            with self.subTest(kind=kind, nested_at=nested_at):
+                repo = make_repo(os.path.join(self.tmp, "case%d" % i))
+                (repo / ".gitignore").write_text("build\n")
+                run_git(repo, "add", ".gitignore")
+                run_git(repo, "commit", "-q", "-m", "ign")
+                if kind == "file":
+                    (repo / "build").write_text("b\n")
+                else:
+                    os.symlink("a.txt", str(repo / "build"))
+                before, _ = snap.take_snapshot(repo)
+                ign = ignored_paths(repo)
+                self.assertEqual(ign, ["build"])
+                (repo / "build").unlink()
+                inner = repo / nested_at
+                inner.mkdir(parents=True)
+                run_git(inner, "init", "-q")
+                (inner / "f.txt").write_text("f\n")
+                (repo / ".gitignore").write_text("")
+                (repo / "a.txt").write_text("changed\n")
+                after, _ = snap.take_snapshot(repo, exclude=ign, keep_from=before)
+                self.assertEqual(run_git(repo, "ls-tree", "-r", "--name-only", after, "build"), b"")
+                self.assertEqual({c.path for c in diff_trees(repo, before, after)[0]}, {"a.txt", ".gitignore"})
+                undo(repo, before, after, protect=ign)
+                self.assertEqual((repo / "a.txt").read_text(), "one\ntwo\nthree\n")
+                self.assertEqual((repo / ".gitignore").read_text(), "build\n")
+                self.assertEqual((inner / "f.txt").read_text(), "f\n")
+
+    def test_kept_file_inside_a_new_nested_repo_is_not_deleted(self):
+        # The run ignores tools/ and makes it a nested repo: `git add -f tools/x.py` exits 0 but
+        # adds nothing, so the before entry must be put back as is.
+        for i, commit in enumerate((False, True)):
+            with self.subTest(commit=commit):
+                repo = make_repo(os.path.join(self.tmp, "case%d" % i))
+                (repo / "tools").mkdir()
+                (repo / "tools" / "x.py").write_text("print(1)\n")
+                (repo / "other.txt").write_text("before\n")
+                before = snapshot_tree(repo)
+                ign = ignored_paths(repo)
+                (repo / "other.txt").write_text("after\n")
+                (repo / ".gitignore").write_text("tools/\n")
+                run_git(repo / "tools", "init", "-q")  # the guard blocks git init, so the test does it
+                if commit:
+                    run_git(repo / "tools", "add", "x.py")
+                    run_git(repo / "tools", "-c", "user.name=T", "-c", "user.email=t@example.com",
+                            "-c", "commit.gpgsign=false", "commit", "-q", "-m", "inner")
+                after, _ = snap.take_snapshot(repo, exclude=ign, keep_from=before)
+                self.assertEqual({c.path for c in diff_trees(repo, before, after)[0]}, {"other.txt", ".gitignore"})
+                undo(repo, before, after, protect=ign)
+                self.assertEqual((repo / "other.txt").read_text(), "before\n")
+                self.assertFalse((repo / ".gitignore").exists())
+                self.assertEqual((repo / "tools" / "x.py").read_text(), "print(1)\n")
+
+    def test_case_only_rename_of_untracked_file_is_never_deleted_by_undo(self):
+        # With core.ignorecase, `git add -f Notes.txt` updates the notes.txt entry, so Notes.txt
+        # looks skipped; putting its before entry back would make undo delete the only file.
+        repo = make_repo(self.tmp)
+        (repo / "Notes.txt").write_text("precious\n")
+        if not (repo / "notes.txt").exists():
+            self.skipTest("needs a case-insensitive filesystem")
+        before = snapshot_tree(repo)
+        ign = ignored_paths(repo)
+        os.rename(str(repo / "Notes.txt"), str(repo / "notes.txt"))
+        after = snapshot_tree(repo, exclude=ign, keep_from=before)
+        try:
+            undo(repo, before, after, protect=ign)
+        except SnapshotError:
+            pass  # refusing is fine (see TODOS.md); deleting the file is not
+        names = [n for n in os.listdir(str(repo)) if n.lower() == "notes.txt"]
+        self.assertEqual(len(names), 1)
+        self.assertEqual((repo / names[0]).read_text(), "precious\n")
+
+    def test_undo_backup_error_is_a_snapshot_error(self):
+        # copytree raises shutil.Error (an OSError) on the FIFO; undo must say what it could not
+        # back up, in words, and change nothing.
+        repo = make_repo(self.tmp)
+        (repo / "keep.txt").write_text("keep\n")
+        (repo / "notes").write_text("my notes\n")
+        before = snapshot_tree(repo)
+        ign = ignored_paths(repo)
+        (repo / "keep.txt").write_text("edited by the run\n")
+        (repo / "notes").unlink()
+        (repo / "notes").mkdir()
+        fifo = repo / "notes" / "pipe"
+        os.mkfifo(str(fifo))
+        after = snapshot_tree(repo, exclude=ign, keep_from=before)
+        finished, _, exc = call_near_fifo(fifo, lambda: undo(repo, before, after, protect=ign))
+        self.assertTrue(finished, "undo blocked on a FIFO")
+        self.assertIsInstance(exc, SnapshotError)
+        self.assertTrue(str(exc).startswith("cannot undo: could not back up notes before undoing ("), str(exc))
+        self.assertTrue(str(exc).endswith("); nothing was changed"), str(exc))
+        self.assertIn("notes/pipe", str(exc))
+        self.assertNotIn("b'", str(exc))
+        self.assertEqual((repo / "keep.txt").read_text(), "edited by the run\n")
+        self.assertEqual(os.listdir(str(repo / "notes")), ["pipe"])
+        self.assertTrue(stat.S_ISFIFO(os.lstat(str(fifo)).st_mode))
+
+    def test_back_up_writes_a_manifest(self):
+        repo = make_repo(self.tmp)
+        os.symlink("a.txt", str(repo / "link"))
+        (repo / "d").mkdir()
+        (repo / "d" / "f.txt").write_text("f\n")
+        store = tempfile.mkdtemp(dir=self.tmp)
+        names = [b"a.txt", b"link", b"d", b"gone/new.txt"]
+        saved, _ = snap._back_up(repo, names, store)
+        self.assertEqual([s[1] for s in saved], ["file", "link", "dir", "missing"])
+        with open(os.path.join(store, "MANIFEST.txt"), "rb") as fh:
+            self.assertEqual(fh.read(), b"0\tfile\ta.txt\n1\tlink\tlink\ta.txt\n2\tdir\td\n3\tmissing\tgone/new.txt\n")
+
+    def test_failed_rollback_names_the_manifest(self):
+        repo = make_repo(self.tmp)
+        (repo / "notes").write_text("my notes\n")
+        before = snapshot_tree(repo)
+        ign = ignored_paths(repo)
+        (repo / ".gitignore").write_text("notes\n")
+        (repo / "notes").unlink()
+        (repo / "notes").mkdir()
+        (repo / "notes" / "inner.txt").write_text("inner\n")  # ignored: git apply cannot write notes
+        after = snapshot_tree(repo, exclude=ign, keep_from=before)
+        with mock.patch.object(snap, "_roll_back", side_effect=OSError("disk gone")):
+            with self.assertRaises(SnapshotError) as cm:
+                undo(repo, before, after, protect=ign)
+        text = str(cm.exception)
+        self.assertIn("putting the files back also failed (disk gone)", text)
+        self.assertIn("MANIFEST.txt", text)
+        kept = text.split("copies of the files as they were before the undo are in ")[1].split(" ")[0]
+        self.addCleanup(shutil.rmtree, kept, True)
+        self.assertTrue(os.path.isfile(os.path.join(kept, "MANIFEST.txt")))
+
+    def _state(self, repo, names):
+        """Type, mode and content of each path (directories recursively), for exact comparisons."""
+        out = {}
+        for name in names:
+            path = repo / name
+            if path.is_symlink():
+                out[name] = ("link", os.readlink(str(path)))
+            elif path.is_dir():
+                out[name] = ("dir", sorted(
+                    (os.path.relpath(os.path.join(d, f), str(path)), Path(d, f).read_bytes())
+                    for d, _, files in os.walk(str(path)) for f in files))
+            elif path.exists():
+                out[name] = ("file", path.stat().st_mode, path.read_bytes())
+            else:
+                out[name] = None
+        return out
+
+    def test_failed_undo_changes_nothing(self):
+        # git apply --check accepts creating a file where a directory now is, then apply fails
+        # partway; undo must roll back what it already wrote.
+        repo = make_repo(self.tmp)
+        (repo / "keep.txt").write_text("keep\n")
+        (repo / "notes").write_text("my notes\n")
+        run_git(repo, "add", "keep.txt", "notes")
+        run_git(repo, "commit", "-q", "-m", "notes")
+        before = snapshot_tree(repo)
+        ign = ignored_paths(repo)
+        (repo / "keep.txt").write_text("edited by the run\n")
+        (repo / ".gitignore").write_text("notes\n")
+        (repo / "notes").unlink()
+        (repo / "notes").mkdir()
+        (repo / "notes" / "inner.txt").write_text("inner\n")
+        after = snapshot_tree(repo, exclude=ign, keep_from=before)
+        names = ["keep.txt", ".gitignore", "notes"]
+        state = self._state(repo, names)
+        with self.assertRaises(SnapshotError) as cm:
+            undo(repo, before, after, protect=ign)
+        self.assertEqual(self._state(repo, names), state)
+        self.assertIn("nothing was changed", str(cm.exception))
+        shutil.rmtree(str(repo / "notes"))
+        undo(repo, before, after, protect=ign)  # works once the directory is gone
+        self.assertEqual((repo / "keep.txt").read_text(), "keep\n")
+        self.assertFalse((repo / ".gitignore").exists())
+        self.assertEqual((repo / "notes").read_text(), "my notes\n")
+
+    def test_git_error_names_the_subcommand(self):
+        repo = make_repo(self.tmp)
+        with self.assertRaises(SnapshotError) as cm:
+            snap._git(repo, ["-c", "core.splitIndex=false", "no-such-subcommand"])
+        self.assertTrue(str(cm.exception).startswith("git no-such-subcommand failed"), str(cm.exception))
+        with self.assertRaises(SnapshotError) as cm:
+            snap._git_head(repo, ["-c", "core.splitIndex=false", "no-such-subcommand"], 100)
+        self.assertTrue(str(cm.exception).startswith("git no-such-subcommand failed"), str(cm.exception))
+
+    def test_assume_unchanged_edit_is_seen(self):
+        repo = make_repo(self.tmp)
+        run_git(repo, "update-index", "--assume-unchanged", "a.txt")
+        before = snapshot_tree(repo)
+        (repo / "a.txt").write_text("edited by the run\n")
+        after = snapshot_tree(repo)
+        self.assertEqual([(c.path, c.change) for c in diff_trees(repo, before, after)[0]],
+                         [("a.txt", "modified")])
+        undo(repo, before, after)
+        self.assertEqual((repo / "a.txt").read_text(), "one\ntwo\nthree\n")
+        self.assertIn(b"h a.txt", run_git(repo, "ls-files", "-v"))  # the real index keeps its bit
+
+    def test_git_env_drops_key_variables_and_fsmonitor(self):
+        snap.set_secret_env_names(["DLLM_TEST_KEY_A"])
+        self.addCleanup(snap.set_secret_env_names, ())
+        with mock.patch.dict(os.environ, {"DLLM_TEST_KEY_A": "sk-secret-value-1", "DLLM_TEST_OTHER": "kept"}):
+            cmd, env = snap._command(["status"], None)
+        self.assertNotIn("DLLM_TEST_KEY_A", env)
+        self.assertEqual(env["DLLM_TEST_OTHER"], "kept")
+        self.assertIn("core.fsmonitor=false", cmd)
+        self.assertEqual(cmd[cmd.index("core.fsmonitor=false") - 1], "-c")
+        self.assertLess(cmd.index("core.fsmonitor=false"), cmd.index("status"))
+
+    def test_git_stdin_is_devnull_without_input(self):
+        repo = make_repo(self.tmp)
+        seen = []
+        real = subprocess.run
+
+        def spy(*args, **kwargs):
+            seen.append(kwargs)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(subprocess, "run", spy):
+            snap._git(repo, ["status"])
+            snap._git(repo, ["hash-object", "--stdin"], input=b"x")
+        self.assertIs(seen[0].get("stdin"), subprocess.DEVNULL)
+        self.assertNotIn("input", seen[0])
+        self.assertEqual(seen[1].get("input"), b"x")
 
     def test_temp_index_removed(self):
         repo = make_repo(self.tmp)
@@ -392,6 +712,49 @@ class SnapshotTests(unittest.TestCase):
         changes, text, _ = diff_trees(repo, before, after)
         self.assertEqual([c.path for c in changes], [".gitignore"])
         self.assertNotIn("SECRET_KEY", text)
+
+    def test_reverse_ignore_drift_keeps_before_files(self):
+        # The run ignores a directory that was untracked (and so in the before tree).
+        repo = make_repo(self.tmp)
+        (repo / "dep").mkdir()
+        (repo / "dep" / "m.js").write_text("module\n")
+        before = snapshot_tree(repo)
+        ign = ignored_paths(repo)
+        (repo / ".gitignore").write_text("dep/\n")
+        (repo / "a.txt").write_text("changed\n")
+        after = snapshot_tree(repo, exclude=ign, keep_from=before)
+        self.assertEqual({c.path for c in diff_trees(repo, before, after)[0]}, {".gitignore", "a.txt"})
+        undo(repo, before, after, protect=ign)
+        self.assertEqual((repo / "a.txt").read_text(), "one\ntwo\nthree\n")
+        self.assertEqual((repo / "dep" / "m.js").read_text(), "module\n")
+        self.assertFalse((repo / ".gitignore").exists())
+
+    def test_reverse_ignore_drift_glob(self):
+        repo = make_repo(self.tmp)
+        (repo / "debug.log").write_text("log\n")
+        before = snapshot_tree(repo)
+        ign = ignored_paths(repo)
+        (repo / ".gitignore").write_text("*.log\n")
+        after = snapshot_tree(repo, exclude=ign, keep_from=before)
+        self.assertEqual([c.path for c in diff_trees(repo, before, after)[0]], [".gitignore"])
+        undo(repo, before, after, protect=ign)
+        self.assertEqual((repo / "debug.log").read_text(), "log\n")
+        self.assertFalse((repo / ".gitignore").exists())
+
+    def test_keep_from_does_not_force_add_a_new_directory(self):
+        # A before-tree file the run replaced with a directory is not force-added, which
+        # would pull ignored files inside it (here x/creds.env) into the snapshot.
+        repo = self._drift({".gitignore": "*.env\n", "x": "file\n"})
+        run_git(repo, "add", ".gitignore")
+        before = snapshot_tree(repo)
+        ign = ignored_paths(repo)
+        (repo / "x").unlink()
+        (repo / "x").mkdir()
+        (repo / "x" / "creds.env").write_text("SECRET_KEY=hunter2\n")
+        after = snapshot_tree(repo, exclude=ign, keep_from=before)
+        changes, text, _ = diff_trees(repo, before, after)
+        self.assertEqual([(c.path, c.change) for c in changes], [("x", "deleted")])
+        self.assertNotIn("hunter2", text)
 
     def test_trailing_space_filename(self):
         repo = self._drift({".gitignore": "*.tmp*\n", "a.tmp  ": "t\n"})

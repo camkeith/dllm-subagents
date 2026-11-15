@@ -72,6 +72,7 @@ class RunsTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         os.environ.pop("CLAUDE_PROJECT_DIR", None)  # restored by patch.dict on stop
+        self.addCleanup(snapshot.set_secret_env_names, ())  # RunManager sets them module-wide
         self.repo = make_repo(self.tmp)
         self.release = threading.Event()
         self.clients = []
@@ -563,17 +564,17 @@ class RunsTest(unittest.TestCase):
         self.assertEqual(m.wait(rid2, 20)["status"], "done")
 
     def test_after_snapshot_failure(self):
-        real = snapshot.snapshot_tree
+        real = snapshot.take_snapshot
         calls = []
 
-        def flaky(repo, exclude=()):
+        def flaky(repo, exclude=(), keep_from=None):
             calls.append(exclude)
             if len(calls) > 1:
                 raise snapshot.SnapshotError("disk on fire")
-            return real(repo, exclude)
+            return real(repo, exclude, keep_from)
 
         m = self.manager([write("x.txt"), finish()], [finish()])
-        with mock.patch.object(snapshot, "snapshot_tree", flaky):
+        with mock.patch.object(snapshot, "take_snapshot", flaky):
             rid = m.start("t", workdir=str(self.repo))
             view = m.wait(rid, 20)
         self.assertEqual(view["status"], "error")
@@ -638,6 +639,7 @@ class RunsTest(unittest.TestCase):
         self.assertTrue((self.repo / "new.txt").exists())
         msg = m.undo(rid)
         self.assertIn(rid, msg)
+        self.assertIn("back to how they were before it started (line endings follow your git settings).", msg)
         self.assertFalse((self.repo / "new.txt").exists())
         self.assertEqual((self.repo / "a.txt").read_text(), "one\ntwo\nthree\n")
         self.assertEqual((self.repo / "b.txt").read_text(), "keep\n")
@@ -724,7 +726,114 @@ class RunsTest(unittest.TestCase):
         self.assertFalse((self.repo / "new.txt").exists())
         self.assertEqual((self.repo / "secret.env").read_text(), "TOKEN=changed\n")
 
+    def test_run_that_ignores_untracked_files_keeps_them(self):
+        (self.repo / "dep").mkdir()
+        (self.repo / "dep" / "m.js").write_text("module\n")
+        m = self.manager([
+            write(".gitignore", "dep/\n"),
+            tool_completion(("edit", {"path": "a.txt", "edits": [{"old_text": "two", "new_text": "TWO"}]})),
+            finish(),
+        ])
+        rid = m.start("t", workdir=str(self.repo))
+        view = m.wait(rid, 20)
+        self.assertEqual(sorted(f["path"] for f in view["changed_files"]), [".gitignore", "a.txt"])
+        m.undo(rid)
+        self.assertEqual((self.repo / "a.txt").read_text(), "one\ntwo\nthree\n")
+        self.assertEqual((self.repo / "dep" / "m.js").read_text(), "module\n")
+        self.assertFalse((self.repo / ".gitignore").exists())
+
+    def test_nested_repo_without_commit_is_noted(self):
+        vendor = self.repo / "vendor" / "lib"
+        vendor.mkdir(parents=True)
+        git(vendor, "init", "-q")
+        (vendor / "x.js").write_text("x\n")
+        m = self.manager([write("vendor/lib/x.js", "changed\n"), write("app.txt"), finish()])
+        rid = m.start("t", workdir=str(self.repo))
+        view = m.wait(rid, 20)
+        self.assertEqual(view["status"], "done")
+        self.assertEqual([f["path"] for f in view["changed_files"]], ["app.txt"])
+        self.assertEqual(view["nested"], ["vendor/lib/"])
+        self.assertIn("not tracked: nested git repository vendor/lib/ (changes inside are not in this "
+                      "diff, and undo does not revert them)", render_view(view))
+        self.assertEqual(self.record(rid).nested, ["vendor/lib/"])
+
+    def test_nested_repo_whose_git_dir_the_run_deletes_is_kept(self):
+        vendor = self.repo / "vendor"
+        vendor.mkdir()
+        git(vendor, "init", "-q")
+        (vendor / "lib.py").write_text("LIB = 1\n")
+        m = self.manager([bash("rm -rf vendor/.git"), write("app.txt"), finish()])
+        rid = m.start("t", workdir=str(self.repo))
+        view = m.wait(rid, 20)
+        self.assertEqual(view["status"], "done")
+        self.assertEqual([f["path"] for f in view["changed_files"]], ["app.txt"])
+        m.undo(rid)
+        self.assertEqual((vendor / "lib.py").read_text(), "LIB = 1\n")
+        self.assertFalse((self.repo / "app.txt").exists())
+
+    def test_directory_that_becomes_a_nested_repo_is_not_deleted(self):
+        (self.repo / "proj").mkdir()
+        (self.repo / "proj" / "a.txt").write_text("a\n")
+
+        def init_proj(messages):
+            git(self.repo / "proj", "init", "-q")  # the guard blocks git init, so the test does it
+            return write("other.txt", "after\n")
+
+        m = self.manager([init_proj, finish()])
+        rid = m.start("t", workdir=str(self.repo))
+        view = m.wait(rid, 20)
+        self.assertEqual([f["path"] for f in view["changed_files"]], ["other.txt"])
+        self.assertEqual(view["nested"], ["proj/"])
+        m.undo(rid)
+        self.assertFalse((self.repo / "other.txt").exists())
+        self.assertEqual((self.repo / "proj" / "a.txt").read_text(), "a\n")
+
+    def test_unreadable_keys_file_does_not_block_a_run(self):
+        # Only the other provider's key would come from keys.env, which is not valid UTF-8.
+        del os.environ[OTHER_ENV]
+        cfg = Path(os.environ["DLLM_SUBAGENTS_CONFIG_DIR"])
+        cfg.mkdir()
+        (cfg / "keys.env").write_bytes(OTHER_ENV.encode() + b"=caf\xe9\n")
+        m = self.manager([finish()])
+        rid = m.start("t", workdir=str(self.repo))
+        self.assertEqual(m.wait(rid, 20)["status"], "done")
+
     # -- keys ------------------------------------------------------------------------
+
+    def test_subagent_env_drops_secret_looking_variables(self):
+        os.environ["GITHUB_TOKEN"] = "ghp-test-token-value-1"
+        os.environ["DLLM_TEST_DB_PASSWORD"] = "hunter2-db-password"
+        m = self.manager([bash('echo "gh=[$GITHUB_TOKEN] db=[$DLLM_TEST_DB_PASSWORD] path=[${PATH:+set}]"'),
+                          finish()])
+        rid = m.start("t", workdir=str(self.repo), check_command='test -z "$GITHUB_TOKEN"')
+        view = m.wait(rid, 20)
+        self.assertEqual(view["status"], "done")  # the check saw no token either
+        self.assertIn("gh=[] db=[] path=[set]", self.clients[0].calls[1][-1]["content"])
+
+    def test_pass_env_keeps_a_named_variable(self):
+        os.environ["NPM_TOKEN"] = "npm-test-token-value"
+        s = settings()
+        s.pass_env = ["NPM_TOKEN"]
+        made = []
+        m = RunManager(s, client_factory=lambda p, k, mo: made.append(FakeClient(
+            [bash('echo "npm=[$NPM_TOKEN]"'), finish()])) or made[-1])
+        self.addCleanup(m.shutdown)
+        rid = m.start("t", workdir=str(self.repo))
+        self.assertEqual(m.wait(rid, 20)["status"], "done")
+        self.assertIn("npm=[npm-test-token-value]", made[0].calls[1][-1]["content"])
+
+    def test_changed_file_named_after_key_is_redacted(self):
+        m = self.manager([write("notes-%s.txt" % SECRET), finish()])
+        rid = m.start("t", workdir=str(self.repo))
+        view = m.wait(rid, 20)
+        self.assertEqual([f["path"] for f in view["changed_files"]], ["notes-***.txt"])
+        for text in (json.dumps(view), render_view(view), (self.runs_path / (rid + ".json")).read_text()):
+            self.assertNotIn(SECRET, text)
+
+    def test_manager_keeps_key_variables_from_git(self):
+        self.manager()
+        self.assertEqual(snapshot._secret_env, frozenset({KEY_ENV, OTHER_ENV}))
+        self.assertNotIn(KEY_ENV, snapshot._command(["status"], None)[1])
 
     def test_subagent_env_has_no_keys(self):
         os.environ["DLLM_TEST_VISIBLE"] = "visible-value"
@@ -829,7 +938,7 @@ class RunsTest(unittest.TestCase):
             raise snapshot.SnapshotError("snap boom")
 
         m = self.manager([finish()], [finish()], [finish()])  # each start builds a client
-        for name in ("snapshot_tree", "ignored_paths"):
+        for name in ("take_snapshot", "ignored_paths"):
             with self.subTest(name=name):
                 with mock.patch.object(snapshot, name, boom):
                     with self.assertRaises(RunError) as cm:

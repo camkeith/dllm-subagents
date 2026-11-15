@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import http.client
 import json
+import socket
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from dllm.config import Profile
-from dllm.llm import ChatClient, LLMError
+from dllm.llm import MAX_RETRY_DELAY, ChatClient, DeadlineReached, LLMError
 
 KEY = "sk-super-secret-key"
 
@@ -112,6 +115,24 @@ class ChatClientTests(unittest.TestCase):
         self.assertEqual(sleeps, [2])
         self.assertEqual(len(fake.requests), 2)
 
+    def test_retry_delay_capped(self):
+        fake = Fake(err(429, "slow", {"Retry-After": "1500"}), ok({"role": "assistant", "content": "x"}))
+        client, sleeps = make(fake)
+        client.complete(MSGS, TOOLS)
+        self.assertEqual(sleeps, [MAX_RETRY_DELAY])
+        self.assertEqual(MAX_RETRY_DELAY, 60)
+
+    def test_cancel_stops_retry_wait(self):
+        cancel = threading.Event()
+        cancel.set()
+        fake = Fake(err(503), ok({"role": "assistant", "content": "x"}))
+        client, sleeps = make(fake)
+        with self.assertRaises(LLMError) as cm:
+            client.complete(MSGS, TOOLS, cancel=cancel)
+        self.assertEqual(str(cm.exception), "cancelled")
+        self.assertEqual(len(fake.requests), 1)
+        self.assertEqual(sleeps, [])
+
     def test_retries_5xx_with_backoff(self):
         fake = Fake(err(503), err(503), ok({"role": "assistant", "content": "x"}))
         client, sleeps = make(fake)
@@ -132,6 +153,15 @@ class ChatClientTests(unittest.TestCase):
         self.assertEqual(client.complete(MSGS, TOOLS).content, "x")
         self.assertEqual(len(fake.requests), 2)
         self.assertEqual(len(sleeps), 1)
+
+    def test_invalid_url_is_not_retried(self):
+        fake = Fake(http.client.InvalidURL("nonnumeric port: 'x'"), ok({"role": "assistant", "content": "x"}))
+        client, sleeps = make(fake)
+        with self.assertRaises(LLMError) as cm:
+            client.complete(MSGS, TOOLS)
+        self.assertIn("Invalid provider URL", str(cm.exception))
+        self.assertEqual(len(fake.requests), 1)
+        self.assertEqual(sleeps, [])
 
     def test_gives_up_after_max_retries(self):
         fake = Fake(*[err(500)] * 5)
@@ -159,8 +189,33 @@ class ChatClientTests(unittest.TestCase):
         with self.assertRaises(LLMError) as cm:
             client.complete(MSGS, TOOLS, deadline=100.5)
         self.assertIn("time limit", str(cm.exception))
+        self.assertEqual(type(cm.exception).__name__, "DeadlineReached")
         self.assertEqual(len(fake.requests), 1)
         self.assertEqual(sleeps, [])
+
+    def test_final_attempt_cut_by_deadline_is_deadline_reached(self):
+        # No retry is left, but the last request's timeout was clamped to the deadline and ran out.
+        now = [0.0]
+        n = [0]
+
+        def transport(url, headers, body, timeout):
+            n[0] += 1
+            if n[0] < 5:
+                return 503, {}, b"{}"
+            now[0] += timeout
+            raise socket.timeout("timed out")
+
+        client = ChatClient(Profile("p", "http://h/v1", "K", "m"), KEY, transport=transport,
+                            sleep=lambda d: now.__setitem__(0, now[0] + d), clock=lambda: now[0])
+        with self.assertRaises(DeadlineReached) as cm:
+            client.complete(MSGS, TOOLS, deadline=40.0)
+        self.assertIn("time limit", str(cm.exception))
+        self.assertEqual(n[0], 5)
+        # Before the deadline, a final failure is still a plain provider error.
+        n[0], now[0] = 0, 0.0
+        with self.assertRaises(LLMError) as cm:
+            client.complete(MSGS, TOOLS, deadline=1000.0)
+        self.assertNotIsInstance(cm.exception, DeadlineReached)
 
     def assert_clean(self, exc):
         for text in (str(exc), repr(exc)):
@@ -205,6 +260,54 @@ class ChatClientTests(unittest.TestCase):
         client, _ = make(Fake())
         self.assertNotIn(KEY, repr(client))
         self.assertNotIn(KEY, str(client))
+
+
+class RedirectTests(unittest.TestCase):
+    def serve(self, handler):
+        server = HTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.server_address[1]
+
+    def test_redirect_is_not_followed(self):
+        hits = []
+
+        class Second(BaseHTTPRequestHandler):
+            def handle_any(self):
+                hits.append((self.command, self.headers.get("Authorization")))
+                data = ok({"role": "assistant", "content": "x"})[2]
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            do_GET = do_POST = handle_any
+
+            def log_message(self, *args):
+                pass
+
+        target = "http://localhost:%d/v1/chat/completions" % self.serve(Second)
+
+        class First(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(302)
+                self.send_header("Location", target)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        profile = Profile("p", "http://127.0.0.1:%d/v1" % self.serve(First), "K", "m")
+        client = ChatClient(profile, KEY, max_retries=0, request_timeout=10)
+        with self.assertRaises(LLMError) as cm:
+            client.complete(MSGS, TOOLS)
+        self.assertEqual(cm.exception.status, 302)
+        self.assertIn("redirected the request (HTTP 302) to host localhost", str(cm.exception))
+        self.assertNotIn(KEY, str(cm.exception))
+        self.assertEqual(hits, [])
 
 
 if __name__ == "__main__":

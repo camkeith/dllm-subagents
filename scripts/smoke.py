@@ -22,9 +22,9 @@ sys.path.insert(0, str(ROOT / "plugins" / "dllm-subagents" / "server"))
 
 from dllm.agent import Agent  # noqa: E402
 from dllm.config import ConfigError, load_settings, resolve_api_key  # noqa: E402
-from dllm.llm import ChatClient  # noqa: E402
+from dllm.llm import NO_REDIRECT_OPENER, ChatClient  # noqa: E402
 from dllm.prompts import build_task_message  # noqa: E402
-from dllm.tools import ToolContext, scrubbed_env  # noqa: E402
+from dllm.tools import ToolContext, run_env  # noqa: E402
 
 TASK = "Create calc.py with add(a, b) and mul(a, b), and test_calc.py with unittest tests for both."
 CHECK = "python3 -m unittest -q test_calc"
@@ -34,7 +34,7 @@ MODEL_LIST_LIMIT = 40
 def list_models(profile, key):
     request = urllib.request.Request(
         profile.base_url.rstrip("/") + "/models", headers={"Authorization": "Bearer " + key})
-    with urllib.request.urlopen(request, timeout=30) as response:
+    with NO_REDIRECT_OPENER.open(request, timeout=30) as response:  # never resend the key on a redirect
         data = json.loads(response.read().decode("utf-8"))
     items = data.get("data") if isinstance(data, dict) else None
     return sorted(str(m.get("id")) for m in (items or []) if isinstance(m, dict))
@@ -61,12 +61,12 @@ def show_models(profile, key):
     return present
 
 
-def run_provider(profile, key, secret_names, limits, keep, redact=()):
+def run_provider(profile, key, secret_names, limits, keep, redact=(), pass_env=()):
     workdir = Path(tempfile.mkdtemp(prefix="dllm-smoke-%s-" % profile.name))
     traj = workdir / "trajectory.json"
     try:
         subprocess.run(["git", "init", "-q"], cwd=str(workdir), check=True)
-        ctx = ToolContext(workdir, threading.Event(), env=scrubbed_env(secret_names))
+        ctx = ToolContext(workdir, threading.Event(), env=run_env(secret_names, pass_env))
         agent = Agent(ChatClient(profile, key), ctx, limits, check_command=CHECK, trajectory_path=traj,
                       redact=redact)
         result = agent.run(build_task_message(TASK, str(workdir), CHECK, [], []))
@@ -123,7 +123,7 @@ def main(argv=None):
     for profile, key in keyed:
         try:
             result, workdir, traj = run_provider(profile, key, secret_names, settings.limits, args.keep,
-                                                 known_keys)
+                                                 known_keys, settings.pass_env)
         except Exception as exc:
             rows.append((profile.name, profile.model, "crashed", "-", "-", "-", "-", "-"))
             failures.append((profile.name, "%s: %s" % (type(exc).__name__, exc)))

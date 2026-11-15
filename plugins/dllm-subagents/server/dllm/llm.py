@@ -2,22 +2,29 @@ from __future__ import annotations
 
 import http.client
 import json
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from .config import Profile
 
 Transport = Callable[[str, dict, bytes, float], Tuple[int, dict, bytes]]
+MAX_RETRY_DELAY = 60
 
 
 class LLMError(Exception):
     def __init__(self, message: str, status: Optional[int] = None):
         super().__init__(message)
         self.status = status
+
+
+class DeadlineReached(LLMError):
+    """The run's time limit left no time to retry the model call."""
 
 
 @dataclass
@@ -37,16 +44,29 @@ class Completion:
     message: dict = field(default_factory=dict)
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Hand 3xx responses back as errors instead of following them: urllib would resend the
+    Authorization header (the key) to the new address."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)  # use for every request that carries a key
+
+
 def urllib_transport(url: str, headers: dict, body: bytes, timeout: float) -> Tuple[int, dict, bytes]:
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with NO_REDIRECT_OPENER.open(request, timeout=timeout) as response:
             return response.status, dict(response.headers.items()), response.read()
     except urllib.error.HTTPError as exc:
         try:
             data = exc.read()
         except Exception:
             data = b""
+        finally:
+            exc.close()
         return exc.code, dict(exc.headers.items()) if exc.headers else {}, data
 
 
@@ -114,7 +134,25 @@ class ChatClient:
             pass
         return self._scrub(text)[:500]
 
-    def complete(self, messages: list, tools: list, deadline: Optional[float] = None) -> Completion:
+    def _redirect_message(self, status: int, headers: dict) -> str:
+        location = _header(headers, "Location") or ""
+        try:  # a relative Location stays on the base_url's host
+            host = (urllib.parse.urlsplit(location).hostname
+                    or urllib.parse.urlsplit(self.profile.base_url).hostname)
+        except ValueError:
+            host = None
+        return self._scrub(
+            "Provider redirected the request (HTTP %d) to host %s; redirects are not followed, so "
+            "the API key is not sent there. Set base_url to the final address." % (status, host or "unknown")
+        )
+
+    def complete(
+        self,
+        messages: list,
+        tools: list,
+        deadline: Optional[float] = None,
+        cancel: Optional[threading.Event] = None,
+    ) -> Completion:
         url = self.profile.base_url.rstrip("/") + "/chat/completions"
         headers = {"Authorization": "Bearer " + self._api_key, "Content-Type": "application/json"}
         body = self._body(messages, tools)
@@ -126,6 +164,8 @@ class ChatClient:
                 if deadline is not None:
                     timeout = max(1.0, min(timeout, deadline - self._clock()))
                 status, resp_headers, raw = self._transport(url, headers, body, timeout)
+            except http.client.InvalidURL as exc:  # retrying cannot fix the configured URL
+                raise LLMError("Invalid provider URL: %s" % self._scrub(str(exc)))
             except ValueError:
                 # e.g. an invalid header value; never echo the text, it may hold the key
                 raise LLMError("Request could not be sent (invalid request data, check the API key format)")
@@ -135,10 +175,14 @@ class ChatClient:
             else:
                 if status == 200:
                     return self._parse(raw)
+                if 300 <= status < 400:
+                    raise LLMError(self._redirect_message(status, resp_headers), status)
                 retry_after = _header(resp_headers, "Retry-After")
                 failure = "Provider returned HTTP %d: %s" % (status, self._error_message(raw))
                 if status != 429 and status < 500:
                     raise LLMError(failure, status)
+            if deadline is not None and self._clock() >= deadline:  # e.g. a timeout clamped to it
+                raise DeadlineReached("Stopped: time limit reached (%s)" % failure, status)
             if attempt >= self._max_retries:
                 raise LLMError(failure, status)
             delay = min(2 ** attempt, 20)
@@ -147,9 +191,13 @@ class ChatClient:
                     delay = max(0.0, float(retry_after))
                 except ValueError:
                     pass
+            delay = min(delay, MAX_RETRY_DELAY)
             if deadline is not None and self._clock() + delay >= deadline:
-                raise LLMError("Stopped retrying: time limit reached (%s)" % failure, status)
-            self._sleep(delay)
+                raise DeadlineReached("Stopped retrying: time limit reached (%s)" % failure, status)
+            if cancel is None:
+                self._sleep(delay)
+            elif cancel.wait(delay):
+                raise LLMError("cancelled")
             attempt += 1
 
     def _parse(self, raw: bytes) -> Completion:

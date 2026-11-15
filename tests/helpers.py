@@ -5,7 +5,6 @@ import json
 import os
 import queue
 import subprocess
-import tempfile
 import threading
 from pathlib import Path
 from typing import Dict, Optional
@@ -66,10 +65,12 @@ class FakeClient:
         self._script = list(script)
         self.calls = []
         self.deadlines = []
+        self.cancels = []
 
-    def complete(self, messages, tools, deadline=None):
+    def complete(self, messages, tools, deadline=None, cancel=None):
         self.calls.append([dict(m) for m in messages])
         self.deadlines.append(deadline)
+        self.cancels.append(cancel)
         if not self._script:
             raise AssertionError("FakeClient script exhausted (call %d)" % len(self.calls))
         item = self._script.pop(0)
@@ -103,6 +104,40 @@ def tool_completion(*calls, content=None, tokens=(100, 10)):
         finish_reason="tool_calls" if calls else "stop",
         message=message,
     )
+
+
+def call_near_fifo(fifo, fn, timeout: float = 5.0):
+    """Run fn() on a thread and return (finished_in_time, result, exception).
+
+    If fn is still blocked opening fifo after timeout, open the other end of the FIFO so the
+    thread can end (a reader sees EOF, a writer finishes into the pipe buffer), so a regression
+    fails instead of hanging the suite.
+    """
+    box: dict = {}
+
+    def target():
+        try:
+            box["result"] = fn()
+        except Exception as exc:
+            box["error"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    finished = not thread.is_alive()
+    if not finished:
+        try:  # a blocked reader: open and close the write end, so it reads EOF
+            os.close(os.open(str(fifo), os.O_WRONLY | os.O_NONBLOCK))
+        except OSError:
+            pass
+        try:  # a blocked writer: hold a read end open while it finishes
+            reader = os.open(str(fifo), os.O_RDONLY | os.O_NONBLOCK)
+        except OSError:
+            reader = None
+        thread.join(timeout)
+        if reader is not None:
+            os.close(reader)
+    return finished, box.get("result"), box.get("error")
 
 
 def isolated_git_env(tmp: str) -> Dict[str, str]:

@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
 from unittest import mock
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -238,13 +239,54 @@ class SmokeTest(unittest.TestCase):
         self.assertIn("Config error", r.stdout)
         self.assertNotIn("Traceback", r.stdout)
 
+    def test_list_models_does_not_follow_redirects(self):
+        hits = []
+
+        class Second(BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args):
+                pass
+
+        def serve(handler):
+            server = HTTPServer(("127.0.0.1", 0), handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            return server.server_address[1]
+
+        target = "http://localhost:%d/v1/models" % serve(Second)
+
+        class First(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header("Location", target)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        module = self._load_module()
+        profile = type("P", (), {"base_url": "http://127.0.0.1:%d/v1" % serve(First)})()
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            module.list_models(profile, FAKE_KEY)
+        cm.exception.close()
+        self.assertEqual(cm.exception.code, 302)
+        self.assertEqual(hits, [])  # the key was never sent to the redirect target
+
     def test_list_models_tolerates_odd_shapes(self):
         module = self._load_module()
         profile = type("P", (), {"base_url": "http://x/v1"})()
         for payload in (b'[]', b'{"data": null}', b'{"data": [1, {"id": "a"}]}'):
             resp = mock.MagicMock()
             resp.__enter__.return_value.read.return_value = payload
-            with mock.patch.object(module.urllib.request, "urlopen", return_value=resp):
+            with mock.patch.object(module.NO_REDIRECT_OPENER, "open", return_value=resp):
                 ids = module.list_models(profile, "k")
             self.assertEqual(ids, ["a"] if b"id" in payload else [])
 

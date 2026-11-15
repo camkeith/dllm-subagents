@@ -4,13 +4,14 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from dllm.agent import Agent
-from dllm.config import Limits
-from dllm.llm import Completion, LLMError
+from dllm.config import Limits, Profile
+from dllm.llm import ChatClient, Completion, LLMError
 from dllm.prompts import SYSTEM_PROMPT
 from dllm.shell import CommandResult
 from dllm.tools import ToolContext, scrubbed_env
@@ -210,6 +211,65 @@ class AgentTest(unittest.TestCase):
         self.assertEqual((res.status, res.limit, res.summary), ("limit_reached", "max_seconds", "partly done"))
         check_run.assert_not_called()
 
+    def test_check_cut_by_time_limit_is_limit_reached(self):
+        now = [0.0]
+
+        def late(messages):
+            now[0] = 293.0
+            return finish("partly done")
+
+        def check_times_out(command, cwd, timeout, cancel_event, env=None):
+            now[0] += timeout  # a timed-out check uses up its whole timeout
+            return CommandResult(output="partial", returncode=-9, timed_out=True, cancelled=False)
+
+        with mock.patch("dllm.agent.run_command", side_effect=check_times_out) as check_run:
+            res = self.agent([late], Limits(max_seconds=300), clock=lambda: now[0],
+                             check_command="make test").run("task")
+        self.assertEqual(check_run.call_args[0][2], 7)  # clamped below check_timeout (300)
+        self.assertEqual((res.status, res.limit, res.summary), ("limit_reached", "max_seconds", "partly done"))
+        self.assertIn("[check timed out after 7s]", res.check.output_tail)
+
+    def test_check_timing_out_at_its_own_timeout_is_a_failure(self):
+        def check_times_out(command, cwd, timeout, cancel_event, env=None):
+            return CommandResult(output="slow", returncode=-9, timed_out=True, cancelled=False)
+
+        with mock.patch("dllm.agent.run_command", side_effect=check_times_out) as check_run:
+            res = self.agent([finish(), finish(), finish()], Limits(max_seconds=1000), clock=lambda: 0.0,
+                             check_command="make test").run("task")
+        self.assertEqual(check_run.call_args[0][2], 300)
+        self.assertEqual((res.status, res.check.attempts), ("check_failed", 3))
+
+    def test_cancel_during_retry_wait_is_cancelled(self):
+        requests = []
+
+        def transport(url, headers, body, timeout):
+            requests.append(url)
+            return (429, {"Retry-After": "8"}, b'{"error": {"message": "slow down"}}')
+
+        client = ChatClient(Profile("p", "http://h/v1", "K", "m"), "sk-agent-key-123", transport=transport,
+                            max_retries=1)
+        threading.Timer(0.3, self.cancel.set).start()
+        started = time.monotonic()
+        res = Agent(client, self.ctx, Limits()).run("task")
+        self.assertLess(time.monotonic() - started, 5)  # not the 8 s Retry-After
+        self.assertEqual((res.status, res.error), ("cancelled", None))
+        self.assertEqual(len(requests), 1)
+
+    def test_model_call_stopped_by_deadline_is_limit_reached(self):
+        def transport(url, headers, body, timeout):
+            return (503, {}, b"busy")
+
+        client = ChatClient(Profile("p", "http://h/v1", "K", "m"), "sk-agent-key-123", transport=transport,
+                            sleep=lambda s: None, clock=lambda: 299.5)
+        res = Agent(client, self.ctx, Limits(max_seconds=300), clock=lambda: 0.0).run("task")
+        self.assertEqual((res.status, res.limit), ("limit_reached", "max_seconds"))
+        self.assertIn("time limit reached", res.error)  # the last provider failure stays visible
+
+    def test_client_gets_the_cancel_event(self):
+        agent = self.agent([finish()])
+        agent.run("task")
+        self.assertIs(self.client.cancels[0], self.cancel)
+
     def test_token_limit(self):
         script = [tool_completion(("write", {"path": "a", "content": "x"}), tokens=(1_500_000, 600_000))]
         res = self.agent(script).run("task")
@@ -332,6 +392,7 @@ class AgentTest(unittest.TestCase):
         self.assertIn("messages", data)
         self.assertEqual(set(data["stats"]), {"steps", "seconds", "input_tokens", "output_tokens"})
         self.assertEqual(data["stats"]["steps"], res.steps)
+        self.assertNotIn("\n", path.read_text())  # compact JSON, not indented
         self.assertEqual(list(path.parent.iterdir()), [path])
 
     def test_on_step_progress(self):

@@ -47,10 +47,64 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(s.wait_seconds, 55)
         self.assertEqual(s.default_provider, "groq")
 
+    def test_bad_types_raise_config_error(self):
+        cases = [
+            {"providers": []},
+            {"providers": None},
+            {"limits": [1]},
+            {"limits": {"max_steps": "10"}},
+            {"limits": {"max_steps": True}},
+            {"limits": {"max_seconds": 0}},
+            {"limits": {"max_tokens_total": 1.5}},
+            {"wait_seconds": "abc"},
+            {"wait_seconds": True},
+            {"wait_seconds": None},
+            {"wait_seconds": 0},
+            {"wait_seconds": -5},
+            {"default_provider": ["groq"]},
+            {"providers": {"groq": {"model": 5}}},
+            {"providers": {"groq": {"base_url": None}}},
+            {"providers": {"groq": {"api_key_env": ["X"]}}},
+            {"providers": {"groq": {"max_tokens_field": 1}}},
+            {"providers": {"groq": {"max_output_tokens": "8192"}}},
+            {"providers": {"groq": {"max_output_tokens": 0}}},
+            {"providers": {"groq": {"max_output_tokens": True}}},
+            {"providers": {"groq": {"extra_body": []}}},
+            {"providers": {"groq": {"temperature": "hot"}}},
+            {"providers": {"groq": {"temperature": True}}},
+        ]
+        for data in cases:
+            with self.subTest(data=data):
+                with self.assertRaises(ConfigError):
+                    load_settings(user_path=self.user_file(data))
+
+    def test_pass_env(self):
+        self.assertEqual(load_settings(user_path=self.dir / "missing.json").pass_env, [])
+        s = load_settings(user_path=self.user_file({"pass_env": ["NPM_TOKEN", "GH_TOKEN"]}))
+        self.assertEqual(s.pass_env, ["NPM_TOKEN", "GH_TOKEN"])
+        for bad in ("NPM_TOKEN", [1], {"a": 1}, None):
+            with self.subTest(pass_env=bad):
+                with self.assertRaises(ConfigError):
+                    load_settings(user_path=self.user_file({"pass_env": bad}))
+
+    def test_valid_optional_types_accepted(self):
+        for temp in (None, 0, 0.5):
+            s = load_settings(user_path=self.user_file({"providers": {"groq": {"temperature": temp}}}))
+            self.assertEqual(s.profiles["groq"].temperature, temp)
+        s = load_settings(user_path=self.user_file({"wait_seconds": 12.5, "limits": {"max_steps": 1}}))
+        self.assertEqual((s.wait_seconds, s.limits.max_steps), (12.5, 1))
+
     def test_clamp_limits_caps(self):
         self.assertEqual(clamp_limits(Limits(), 500, 99999), Limits(150, 1800, 2_000_000))
         self.assertEqual(clamp_limits(Limits(), 0, 1), Limits(1, 10, 2_000_000))
         self.assertEqual(clamp_limits(Limits(), None, None), Limits())
+
+    def test_codex_forwards_every_shipped_key_variable(self):
+        codex = json.loads((config.DEFAULTS_PATH.parent.parent / "codex.mcp.json").read_text())
+        env_vars = codex["mcpServers"]["fast-agent"]["env_vars"]
+        shipped = json.loads(config.DEFAULTS_PATH.read_text())["providers"]
+        self.assertEqual(sorted(env_vars), sorted({p["api_key_env"] for p in shipped.values()}))
+        self.assertEqual(len(env_vars), len(set(env_vars)))
 
     def test_config_dir_env(self):
         import os
@@ -86,6 +140,16 @@ class KeyTests(unittest.TestCase):
     def test_key_from_keys_file(self):
         self.keys.write_text('# comment\n\nOTHER=zzz\nGROQ_API_KEY = "file"\n')
         self.assertEqual(resolve_api_key(self.profile, {}, self.keys), "file")
+
+    def test_keys_file_with_bom(self):
+        self.keys.write_bytes(b"\xef\xbb\xbfGROQ_API_KEY=file\n")
+        self.assertEqual(resolve_api_key(self.profile, {}, self.keys), "file")
+
+    def test_non_utf8_keys_file_is_config_error(self):
+        self.keys.write_bytes(b"GROQ_API_KEY=caf\xe9\n")
+        with self.assertRaises(ConfigError) as cm:
+            resolve_api_key(self.profile, {}, self.keys)
+        self.assertEqual(str(cm.exception), "cannot read %s: not valid UTF-8" % self.keys)
 
     def test_missing_key_message(self):
         self.keys.write_text("OTHER_KEY=secretvalue\n")

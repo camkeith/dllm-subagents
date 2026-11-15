@@ -4,11 +4,14 @@ import json
 import os
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Dict, Mapping, Optional
+from typing import Dict, List, Mapping, Optional
 
+HARD_MIN_STEPS = 1
 HARD_MAX_STEPS = 150
+HARD_MIN_SECONDS = 10
 HARD_MAX_SECONDS = 1800
 MAX_WAIT_SECONDS = 55
+DEFAULT_WAIT_SECONDS = 50.0
 
 DEFAULTS_PATH = Path(__file__).resolve().parent.parent / "providers.default.json"
 
@@ -41,7 +44,8 @@ class Settings:
     default_provider: str
     profiles: Dict[str, Profile]
     limits: Limits
-    wait_seconds: float = 50.0
+    wait_seconds: float = DEFAULT_WAIT_SECONDS
+    pass_env: List[str] = field(default_factory=list)  # secret-looking variables the subagent may see
 
 
 def config_dir() -> Path:
@@ -75,6 +79,22 @@ def _merge_provider(raw: Dict[str, dict], name: str, patch: dict, source: Path) 
     raw.setdefault(name, {}).update(patch)
 
 
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _section(data: dict, key: str, source: Path) -> dict:
+    if key not in data:
+        return {}
+    if not isinstance(data[key], dict):
+        raise ConfigError("%s in %s must be an object" % (key, source))
+    return data[key]
+
+
 def _build_profile(name: str, data: dict) -> Profile:
     known = {f.name for f in fields(Profile)} - {"name"}
     unknown = set(data) - known
@@ -83,6 +103,15 @@ def _build_profile(name: str, data: dict) -> Profile:
     missing = [k for k in ("base_url", "api_key_env", "model") if k not in data]
     if missing:
         raise ConfigError("Provider %r is missing: %s" % (name, ", ".join(missing)))
+    for key in ("base_url", "api_key_env", "model", "max_tokens_field"):
+        if key in data and not isinstance(data[key], str):
+            raise ConfigError("Provider %r: %s must be a string" % (name, key))
+    if "max_output_tokens" in data and not (_is_int(data["max_output_tokens"]) and data["max_output_tokens"] > 0):
+        raise ConfigError("Provider %r: max_output_tokens must be a positive integer" % name)
+    if "extra_body" in data and not isinstance(data["extra_body"], dict):
+        raise ConfigError("Provider %r: extra_body must be an object" % name)
+    if data.get("temperature") is not None and not _is_number(data["temperature"]):
+        raise ConfigError("Provider %r: temperature must be a number or null" % name)
     return Profile(name=name, **data)
 
 
@@ -93,34 +122,43 @@ def load_settings(defaults_path: Optional[Path] = None, user_path: Optional[Path
     user = _read_json(user_path, required=False)
 
     raw: Dict[str, dict] = {}
+    limit_values: dict = {}
     for source, data in ((defaults_path, defaults), (user_path, user)):
-        for name, patch in (data.get("providers") or {}).items():
+        for name, patch in _section(data, "providers", source).items():
             _merge_provider(raw, name, patch, source)
+        limit_values.update(_section(data, "limits", source))
     profiles = {name: _build_profile(name, data) for name, data in raw.items()}
 
-    limit_values: dict = {}
-    limit_values.update(defaults.get("limits") or {})
-    limit_values.update(user.get("limits") or {})
+    limit_names = {f.name for f in fields(Limits)}
+    for key, value in limit_values.items():
+        if key in limit_names and not (_is_int(value) and value >= 1):
+            raise ConfigError("Invalid limits: %s must be an integer of at least 1, got %r" % (key, value))
     try:
         limits = Limits(**limit_values)
     except TypeError as exc:
         raise ConfigError("Invalid limits: %s" % exc)
 
     default_provider = user.get("default_provider") or defaults.get("default_provider")
-    if default_provider not in profiles:
+    if not isinstance(default_provider, str) or default_provider not in profiles:
         raise ConfigError("default_provider %r is not a known provider" % (default_provider,))
 
-    wait = user.get("wait_seconds", defaults.get("wait_seconds", 50))
+    wait = user.get("wait_seconds", defaults.get("wait_seconds", DEFAULT_WAIT_SECONDS))
+    if not _is_number(wait) or not wait > 0:
+        raise ConfigError("wait_seconds must be a positive number of seconds, got %r" % (wait,))
     wait = min(float(wait), MAX_WAIT_SECONDS)
-    return Settings(default_provider, profiles, limits, wait)
+
+    pass_env = user.get("pass_env", defaults.get("pass_env", []))
+    if not isinstance(pass_env, list) or not all(isinstance(n, str) for n in pass_env):
+        raise ConfigError("pass_env must be a list of environment variable names, got %r" % (pass_env,))
+    return Settings(default_provider, profiles, limits, wait, list(pass_env))
 
 
 def clamp_limits(base: Limits, max_steps: Optional[int], max_seconds: Optional[int]) -> Limits:
     steps = base.max_steps if max_steps is None else max_steps
     seconds = base.max_seconds if max_seconds is None else max_seconds
     return Limits(
-        max_steps=max(1, min(int(steps), HARD_MAX_STEPS)),
-        max_seconds=max(10, min(int(seconds), HARD_MAX_SECONDS)),
+        max_steps=max(HARD_MIN_STEPS, min(int(steps), HARD_MAX_STEPS)),
+        max_seconds=max(HARD_MIN_SECONDS, min(int(seconds), HARD_MAX_SECONDS)),
         max_tokens_total=base.max_tokens_total,
     )
 
@@ -128,7 +166,9 @@ def clamp_limits(base: Limits, max_steps: Optional[int], max_seconds: Optional[i
 def _parse_env_file(path: Path) -> Dict[str, str]:
     values: Dict[str, str] = {}
     try:
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8-sig")  # tolerate a BOM from Windows editors
+    except UnicodeDecodeError:
+        raise ConfigError("cannot read %s: not valid UTF-8" % path)
     except OSError:
         return values
     for line in text.splitlines():

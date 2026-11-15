@@ -8,7 +8,7 @@ import threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dllm import VERSION  # noqa: E402
-from dllm.config import ConfigError, load_settings  # noqa: E402
+from dllm.config import DEFAULT_WAIT_SECONDS, ConfigError, load_settings  # noqa: E402
 from dllm.mcp import McpServer  # noqa: E402
 from dllm.runs import RunManager  # noqa: E402
 from dllm.server_tools import build_tool_specs  # noqa: E402
@@ -37,21 +37,23 @@ def _install_signal_handlers(manager) -> None:
         if started.acquire(False):
             threading.Thread(target=finish_and_exit, daemon=True).start()
 
-    signal.signal(signal.SIGTERM, handler)
-    signal.signal(signal.SIGINT, handler)
+    for name in ("SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), handler)
 
 
 def main() -> None:
     _configure_stdio()
     manager = None
     config_error = None
-    wait_seconds = 50.0
+    wait_seconds = DEFAULT_WAIT_SECONDS
     try:
         settings = load_settings()
         manager = RunManager(settings)
         wait_seconds = settings.wait_seconds
-    except ConfigError as exc:
-        config_error = str(exc)
+    except (ConfigError, TypeError, ValueError, AttributeError) as exc:
+        config_error = str(exc) if isinstance(exc, ConfigError) else (
+            "Invalid config: %s: %s" % (type(exc).__name__, exc))
         print("fast-agent: config error: " + config_error, file=sys.stderr, flush=True)
     _install_signal_handlers(manager)
     server = McpServer("fast-agent", VERSION, build_tool_specs(manager, wait_seconds, config_error))
