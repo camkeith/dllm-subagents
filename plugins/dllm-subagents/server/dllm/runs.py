@@ -33,6 +33,7 @@ MAX_GROUP_LINES = 20
 _POLL = 0.05
 _RUN_ID = re.compile(r"\d{8}-\d{6}-[0-9a-f]{6}")
 _UNDO_OWNER = "undo:"
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent.parent  # server/dllm/runs.py -> plugin root
 
 
 def runs_dir() -> Path:
@@ -126,6 +127,21 @@ def _error_view(run: _Run, error: str) -> dict:
     }
 
 
+def _default_workdir() -> Optional[str]:
+    """CLAUDE_PROJECT_DIR, else the server's working directory, unless that is inside the
+    plugin's own directory (Codex starts the server there), which is never the repo to work in."""
+    if os.environ.get("CLAUDE_PROJECT_DIR"):
+        return os.environ["CLAUDE_PROJECT_DIR"]
+    try:
+        cwd = os.path.realpath(os.getcwd())
+    except OSError:
+        return None
+    plugin = os.path.realpath(str(PLUGIN_ROOT))
+    if cwd == plugin or cwd.startswith(plugin.rstrip(os.sep) + os.sep):
+        return None
+    return cwd
+
+
 def _new_run_id() -> str:
     return time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
 
@@ -196,7 +212,9 @@ class RunManager:
             raise RunError("the server is shutting down; not starting a new run")
         if not isinstance(task, str) or not task.strip():
             raise RunError("task must be a non-empty string")
-        workdir = workdir or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+        workdir = workdir or _default_workdir()
+        if not workdir:
+            raise RunError("pass workdir: the absolute path of the git repo to work in")
         if not os.path.isabs(workdir):
             raise RunError("workdir must be an absolute path, got %r" % workdir)
         if not os.path.isdir(workdir):

@@ -300,6 +300,29 @@ class RunsTest(unittest.TestCase):
         self.assertTrue((self.repo / "from_env.txt").exists())
         self.assertEqual(self.record(rid).repo, os.path.realpath(str(self.repo)))
 
+    def test_workdir_falls_back_to_server_cwd(self):
+        m = self.manager([write("from_cwd.txt"), finish()])
+        with mock.patch("os.getcwd", return_value=str(self.repo)):
+            rid = m.start("t")
+        self.assertEqual(m.wait(rid, 20)["status"], "done")
+        self.assertTrue((self.repo / "from_cwd.txt").exists())
+
+    def test_workdir_never_defaults_to_the_plugin_dir(self):
+        # Codex starts the server with cwd = the plugin's own directory (codex.mcp.json "cwd": ".").
+        self.assertTrue((runs.PLUGIN_ROOT / ".mcp.json").exists())
+        plugin = self.repo / "plugin"
+        (plugin / "server").mkdir(parents=True)
+        m = self.manager([finish()])
+        for cwd in (plugin, plugin / "server"):
+            with self.subTest(cwd=cwd):
+                with mock.patch.object(runs, "PLUGIN_ROOT", plugin), \
+                        mock.patch("os.getcwd", return_value=str(cwd)):
+                    with self.assertRaises(RunError) as cm:
+                        m.start("t")
+                self.assertIn("pass workdir: the absolute path of the git repo to work in",
+                              str(cm.exception))
+                self.assert_no_run_started()
+
     # -- locking ---------------------------------------------------------------------
 
     def test_one_run_per_repo(self):

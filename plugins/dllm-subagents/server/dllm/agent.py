@@ -8,6 +8,7 @@ trajectory is saved after every step.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import time
@@ -162,6 +163,13 @@ class Agent:
         if self.input_tokens + self.output_tokens >= self.limits.max_tokens_total:
             raise _Stop("limit_reached", limit="max_tokens_total")
 
+    def _time_left(self) -> float:
+        return self._start + self.limits.max_seconds - self.clock()
+
+    def _timeout(self, limit: int) -> int:
+        """limit, clamped to the run's remaining time (at least 1 s), so a command cannot outlast it."""
+        return max(1, min(limit, int(self._time_left())))
+
     def _scrub(self, text: str) -> str:
         return _redact(text, self.redact)
 
@@ -200,6 +208,10 @@ class Agent:
                 for rest in calls[i:]:
                     self._tool_message(rest.id, "This call was not run: the run was cancelled.")
                 raise _Stop("cancelled")
+            if call.name == "bash" and self._time_left() <= 0:
+                for rest in calls[i:]:
+                    self._tool_message(rest.id, "This call was not run: the run's time limit was reached.")
+                raise _Stop("limit_reached", limit="max_seconds")
             try:
                 args = json.loads(call.arguments) if call.arguments.strip() else {}
                 if not isinstance(args, dict):
@@ -223,8 +235,11 @@ class Agent:
             self._format_errors = 0
 
     def _run_tool(self, name: str, args: dict) -> str:
+        ctx = self.ctx
+        if name == "bash":
+            ctx = dataclasses.replace(ctx, bash_max_timeout=self._timeout(ctx.bash_max_timeout))
         try:
-            return run_tool(name, args, self.ctx)
+            return run_tool(name, args, ctx)
         except ToolError as exc:
             return "Error: %s" % exc
         except Exception as exc:  # unexpected tool failure is reported to the model, not fatal
@@ -252,9 +267,13 @@ class Agent:
             self._tool_message(call_id, "Finished.")
             return _Stop("done")
         attempts = (self.check.attempts if self.check else 0) + 1
+        if self._time_left() <= 0:
+            self._tool_message(call_id, "The run's time limit was reached, so the check was not run.")
+            return _Stop("limit_reached", limit="max_seconds")
+        timeout = self._timeout(self.check_timeout)
         try:
             res = run_command(
-                self.check_command, str(self.ctx.workdir), self.check_timeout, self.ctx.cancel_event,
+                self.check_command, str(self.ctx.workdir), timeout, self.ctx.cancel_event,
                 env=self.ctx.env,
             )
         except OSError as exc:
@@ -262,7 +281,7 @@ class Agent:
             return _Stop("error", error="cannot run check command: %s" % (exc.strerror or exc))
         output = self._scrub_output(res.output)
         if res.timed_out:
-            output += "\n[check timed out after %ds]" % self.check_timeout
+            output += "\n[check timed out after %ds]" % timeout
         self.check = CheckResult(self.check_command, res.returncode, output[-CHECK_TAIL_CHARS:], attempts)
         if res.cancelled:
             self._tool_message(call_id, "The check was cancelled.")

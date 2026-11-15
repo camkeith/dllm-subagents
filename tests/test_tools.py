@@ -100,6 +100,28 @@ class ToolsTest(unittest.TestCase):
         self.assertEqual(resolve_in_workdir(link, "f.txt"), (self.workdir / "f.txt").resolve())
         self.assertEqual(resolve_in_workdir(link, "new.txt"), self.workdir.resolve() / "new.txt")
 
+    def test_write_and_edit_refuse_git_dir(self):
+        git = self.workdir / ".git"
+        (git / "hooks").mkdir(parents=True)
+        (git / "config").write_text("[core]\n")
+        os.symlink(".git/config", str(self.workdir / "cfg-link"))
+        for path in (".git/hooks/pre-commit", ".git/config", "sub/.git/x", ".GIT/hooks/x", "cfg-link"):
+            with self.subTest(path=path):
+                with self.assertRaises(ToolError) as cm:
+                    run_tool("write", {"path": path, "content": "x"}, self.ctx)
+                self.assertIn("inside a .git directory", str(cm.exception))
+        with self.assertRaises(ToolError) as cm:
+            run_tool("edit", {"path": ".git/config", "edits": [{"old_text": "core", "new_text": "x"}]},
+                     self.ctx)
+        self.assertIn("inside a .git directory", str(cm.exception))
+        self.assertEqual((git / "config").read_text(), "[core]\n")
+        self.assertEqual(sorted(os.listdir(str(git / "hooks"))), [])
+        self.assertFalse((self.workdir / "sub").exists())
+        # read still works there, and names that only contain ".git" are fine.
+        self.assertIn("[core]", run_tool("read", {"path": ".git/config"}, self.ctx))
+        run_tool("write", {"path": ".gitignore", "content": "x"}, self.ctx)
+        run_tool("write", {"path": "a.git/b.git", "content": "x"}, self.ctx)
+
     def test_bash_runs_in_workdir(self):
         out = run_tool("bash", {"command": "pwd"}, self.ctx)
         self.assertIn(os.path.realpath(str(self.workdir)), out)

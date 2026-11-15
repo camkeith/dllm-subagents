@@ -12,6 +12,7 @@ from dllm.agent import Agent
 from dllm.config import Limits
 from dllm.llm import Completion, LLMError
 from dllm.prompts import SYSTEM_PROMPT
+from dllm.shell import CommandResult
 from dllm.tools import ToolContext, scrubbed_env
 
 from helpers import FakeClient, tool_completion
@@ -149,6 +150,65 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(res.status, "limit_reached")
         self.assertEqual(res.limit, "max_seconds")
         self.assertEqual(self.client.deadlines[0], 300.0)
+
+    def test_bash_and_check_timeouts_clamped_to_time_left(self):
+        now = [0.0]
+
+        def late(messages):
+            now[0] = 292.5
+            return tool_completion(("bash", {"command": "true", "timeout": 120}))
+
+        ok = CommandResult(output="", returncode=0, timed_out=False, cancelled=False)
+        with mock.patch("dllm.tools.run_command", return_value=ok) as bash_run, \
+                mock.patch("dllm.agent.run_command", return_value=ok) as check_run:
+            res = self.agent([late, finish()], Limits(max_seconds=300), clock=lambda: now[0],
+                             check_command="make test").run("task")
+        self.assertEqual(res.status, "done")
+        self.assertEqual(bash_run.call_args[0][2], 7)
+        self.assertEqual(check_run.call_args[0][2], 7)
+
+    def test_timeout_floor_is_one_second(self):
+        now = [0.0]
+
+        def late(messages):
+            now[0] = 299.6
+            return tool_completion(("bash", {"command": "true"}))
+
+        ok = CommandResult(output="", returncode=0, timed_out=False, cancelled=False)
+        with mock.patch("dllm.tools.run_command", return_value=ok) as bash_run:
+            self.agent([late], Limits(max_seconds=300), clock=lambda: now[0]).run("task")
+        self.assertEqual(bash_run.call_args[0][2], 1)
+
+    def test_no_time_left_ends_run_before_bash(self):
+        now = [0.0]
+
+        def late(messages):
+            now[0] = 300.0
+            return tool_completion(("bash", {"command": "true"}), ("write", {"path": "w.txt", "content": "x"}))
+
+        agent = self.agent([late], Limits(max_seconds=300), clock=lambda: now[0])
+        with mock.patch("dllm.tools.run_command") as bash_run:
+            res = agent.run("task")
+        self.assertEqual((res.status, res.limit), ("limit_reached", "max_seconds"))
+        bash_run.assert_not_called()
+        self.assertFalse((self.workdir / "w.txt").exists())
+        tool_msgs = [m["content"] for m in agent.messages if m["role"] == "tool"]
+        self.assertEqual(len(tool_msgs), 2)
+        for text in tool_msgs:
+            self.assertIn("time limit", text)
+
+    def test_no_time_left_skips_check(self):
+        now = [0.0]
+
+        def late(messages):
+            now[0] = 301.0
+            return finish("partly done")
+
+        with mock.patch("dllm.agent.run_command") as check_run:
+            res = self.agent([late], Limits(max_seconds=300), clock=lambda: now[0],
+                             check_command="make test").run("task")
+        self.assertEqual((res.status, res.limit, res.summary), ("limit_reached", "max_seconds", "partly done"))
+        check_run.assert_not_called()
 
     def test_token_limit(self):
         script = [tool_completion(("write", {"path": "a", "content": "x"}), tokens=(1_500_000, 600_000))]

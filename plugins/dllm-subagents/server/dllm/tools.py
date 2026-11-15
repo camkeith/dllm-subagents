@@ -146,13 +146,16 @@ def scrub_cuts(text: str, values: Iterable[str]) -> str:
     return "".join(parts)
 
 
-def resolve_in_workdir(workdir: Path, path: str) -> Path:
+def resolve_in_workdir(workdir: Path, path: str, for_write: bool = False) -> Path:
     root = Path(os.path.realpath(str(workdir)))
     target = Path(os.path.realpath(os.path.join(str(root), path)))
     try:
-        target.relative_to(root)
+        rel = target.relative_to(root)
     except ValueError:
         raise ToolError("path %r is outside the working directory" % path)
+    # Git internals are not part of the run's diff, so the run could not report or undo them.
+    if for_write and any(part.lower() == ".git" for part in rel.parts):
+        raise ToolError("path %r is inside a .git directory; the file tools do not write there" % path)
     return target
 
 
@@ -214,7 +217,7 @@ def _read(args: dict, ctx: ToolContext) -> str:
 def _write(args: dict, ctx: ToolContext) -> str:
     display = _arg(args, "path", str)
     content = _arg(args, "content", str)
-    path = resolve_in_workdir(ctx.workdir, display)
+    path = resolve_in_workdir(ctx.workdir, display, for_write=True)
     if path.is_dir():
         raise ToolError("%s is a directory" % display)
     data = content.encode("utf-8")
@@ -229,7 +232,7 @@ def _write(args: dict, ctx: ToolContext) -> str:
 def _edit(args: dict, ctx: ToolContext) -> str:
     display = _arg(args, "path", str)
     edits = _arg(args, "edits", list)
-    path = resolve_in_workdir(ctx.workdir, display)
+    path = resolve_in_workdir(ctx.workdir, display, for_write=True)
     try:
         content = path.read_bytes().decode("utf-8")
     except FileNotFoundError:
