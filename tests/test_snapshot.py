@@ -138,6 +138,26 @@ class SnapshotTests(unittest.TestCase):
         # git was stopped once the cap was reached, instead of writing the whole patch.
         self.assertLess(patch[0].returncode, 0)
 
+    def test_diff_redacts_before_cutting(self):
+        repo = make_repo(self.tmp)
+        before = snapshot_tree(repo)
+        key = "sk-diff-secret-0123456789"
+        (repo / "k.txt").write_text("x" * 500 + key + "\n" + "tail line\n" * 50)
+        after = snapshot_tree(repo)
+        _, full, _ = diff_trees(repo, before, after, max_chars=100_000)
+        at = full.index(key)
+        pieces = {key[i:i + 8] for i in range(len(key) - 7)}
+        for cut in (at + 5, at + 12, at + len(key) - 1, at + len(key) + 30):
+            with self.subTest(cut=cut):
+                _, text, truncated = diff_trees(repo, before, after, max_chars=cut, redact=[key])
+                self.assertTrue(truncated)
+                self.assertTrue(text.endswith("[diff truncated]\n"))
+                for piece in pieces:
+                    self.assertNotIn(piece, text)
+        _, text, truncated = diff_trees(repo, before, after, max_chars=100_000, redact=[key])
+        self.assertFalse(truncated)
+        self.assertIn("+" + "x" * 500 + "***\n", text)
+
     def test_diff_read_reports_git_failure(self):
         repo = make_repo(self.tmp)
         with self.assertRaises(SnapshotError) as cm:

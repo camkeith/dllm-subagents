@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import codecs
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -33,6 +34,9 @@ class CommandResult:
 
 def _marker(cut: int) -> str:
     return "\n... [%d characters cut] ...\n" % cut
+
+
+CUT_MARKER_RE = re.compile(r"\n\.\.\. \[\d+ characters cut\] \.\.\.\n")  # matches _marker
 
 
 def truncate_middle(text: str, max_chars: int) -> str:

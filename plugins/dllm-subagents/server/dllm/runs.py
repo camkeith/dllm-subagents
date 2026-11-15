@@ -424,10 +424,11 @@ class RunManager:
         diff, truncated = "", False
         if after is not None:
             try:
-                changes, diff, truncated = snapshot.diff_trees(repo, rec.before_tree, after)
+                # A deleted or edited file may have held a key: redacted before the diff is cut.
+                changes, diff, truncated = snapshot.diff_trees(repo, rec.before_tree, after,
+                                                               redact=keys)
             except Exception as exc:
                 errors.append("could not compute the diff: %s" % exc)
-        diff = redact(diff, keys)  # a deleted or edited file may have held a key
         with run.save_lock:
             rec.after_tree = after
             rec.status = status

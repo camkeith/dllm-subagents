@@ -2,17 +2,19 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterable, Mapping, Optional
+from typing import Callable, Dict, Iterable, List, Mapping, Optional
 
 from .edit import EditError, apply_edits
 from .guard import check_command
-from .shell import run_command
+from .shell import CUT_MARKER_RE, run_command
 
 READ_DEFAULT_LIMIT = 2000
 READ_MAX_LINE_CHARS = 2000
+LINE_CUT_MARKER = "... [line cut]"
 
 
 def _tool(name: str, description: str, properties: dict, required: list) -> dict:
@@ -98,12 +100,50 @@ def scrubbed_env(names: Iterable[str], base: Optional[Mapping[str, str]] = None)
 REDACT_MIN_CHARS = 8
 
 
+def _secrets(values: Iterable[str]) -> List[str]:
+    """The values long enough to redact, longest first (so a key containing another goes whole)."""
+    return sorted({v for v in values if v and len(v) >= REDACT_MIN_CHARS}, key=len, reverse=True)
+
+
 def redact(text: str, values: Iterable[str]) -> str:
     """Replace each secret value (8+ chars; shorter ones are ignored) in text with ***."""
-    for value in values:
-        if value and len(value) >= REDACT_MIN_CHARS:
-            text = text.replace(value, "***")
+    for value in _secrets(values):
+        text = text.replace(value, "***")
     return text
+
+
+def scrub_edge(text: str, values: Iterable[str], at_end: bool) -> str:
+    """Replace a piece (8+ chars) of a secret at the end (or start) of text with ***.
+
+    For text that truncation cut next to a secret: redact() cannot match the half that is left.
+    """
+    best = 0
+    for value in _secrets(values):
+        for k in range(min(len(text), len(value)), max(best, REDACT_MIN_CHARS - 1), -1):
+            if (text[-k:] if at_end else text[:k]) in value:
+                best = k
+                break
+    if not best:
+        return text
+    return text[:-best] + "***" if at_end else "***" + text[best:]
+
+
+_CUTS = re.compile("(%s|%s)" % (CUT_MARKER_RE.pattern, re.escape(LINE_CUT_MARKER)))
+
+
+def scrub_cuts(text: str, values: Iterable[str]) -> str:
+    """After redact(): clear secret pieces left right before or after a truncation marker
+    (bash output's head/tail cut, read's long-line cut)."""
+    values = _secrets(values)
+    parts = _CUTS.split(text)  # text, marker, text, marker, ..., text
+    if not values or len(parts) == 1:
+        return text
+    for i in range(0, len(parts), 2):
+        if i + 1 < len(parts):
+            parts[i] = scrub_edge(parts[i], values, at_end=True)
+        if i > 0:
+            parts[i] = scrub_edge(parts[i], values, at_end=False)
+    return "".join(parts)
 
 
 def resolve_in_workdir(workdir: Path, path: str) -> Path:
@@ -163,7 +203,7 @@ def _read(args: dict, ctx: ToolContext) -> str:
     out = []
     for i, line in enumerate(chunk, start=offset):
         if len(line) > READ_MAX_LINE_CHARS:
-            line = line[:READ_MAX_LINE_CHARS] + "... [line cut]"
+            line = line[:READ_MAX_LINE_CHARS] + LINE_CUT_MARKER
         out.append("%6d\t%s" % (i, line))
     last = offset + len(chunk) - 1
     if offset != 1 or last != total:

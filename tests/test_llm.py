@@ -185,6 +185,14 @@ class ChatClientTests(unittest.TestCase):
             self.assertIn("***", str(cm.exception))
             self.assert_clean(cm.exception)
 
+    def test_unreadable_response_redacted_before_cut(self):
+        raw = ("<html>" + "x" * 480 + KEY + "</html>").encode()
+        client, _ = make(Fake((200, {}, raw)))
+        with self.assertRaises(LLMError) as cm:
+            client.complete(MSGS, TOOLS)
+        for i in range(len(KEY) - 7):
+            self.assertNotIn(KEY[i:i + 8], str(cm.exception))
+
     def test_client_repr_has_no_key(self):
         client, _ = make(Fake())
         self.assertNotIn(KEY, repr(client))

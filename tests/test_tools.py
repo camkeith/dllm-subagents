@@ -132,6 +132,22 @@ class ToolsTest(unittest.TestCase):
         self.assertIn("blocked: no pushing", str(cm.exception))
         m.assert_not_called()
 
+    def test_redact_replaces_longest_value_first(self):
+        text = "a sk-test-secret-123456 b sk-test-secret c"
+        self.assertEqual(tools.redact(text, ["sk-test-secret", "sk-test-secret-123456"]), "a *** b *** c")
+
+    def test_scrub_cuts_clears_pieces_beside_markers(self):
+        key = "sk-test-secret-123456"
+        text = ("head " + key[:10] + "\n... [99 characters cut] ...\n" + key[12:] + " mid " + key[:9]
+                + "... [line cut]\nnot cut " + key[:10])
+        out = tools.scrub_cuts(text, [key])
+        self.assertEqual(out, "head ***\n... [99 characters cut] ...\n*** mid ***... [line cut]\nnot cut "
+                         + key[:10])
+        # Pieces shorter than 8 characters, and text without markers, are left alone.
+        short = "x " + key[:7] + "\n... [5 characters cut] ...\n" + key[-7:]
+        self.assertEqual(tools.scrub_cuts(short, [key]), short)
+        self.assertEqual(tools.scrub_cuts("plain " + key[:12], [key]), "plain " + key[:12])
+
     def test_unknown_tool(self):
         with self.assertRaises(ToolError) as cm:
             run_tool("nope", {}, self.ctx)

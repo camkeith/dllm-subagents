@@ -13,6 +13,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from .tools import redact as _redact
+from .tools import scrub_edge
+
 _TIMEOUT = 60
 _TRUNC_NOTE = "\n... [diff truncated]\n"
 _SCRUB_ENV = (
@@ -242,8 +245,10 @@ _TREE_DIFF = ["diff-tree", "-r", "--no-renames"]
 
 
 def diff_trees(
-    repo: Path, before: str, after: str, max_chars: int = 20_000
+    repo: Path, before: str, after: str, max_chars: int = 20_000, redact: Sequence[str] = ()
 ) -> Tuple[List[FileChange], str, bool]:
+    """File changes, the patch (secret values in `redact` replaced, cut to max_chars), and
+    whether it was cut."""
     repo = repo_root(repo)
     status_out = _git(repo, _TREE_DIFF + ["--name-status", "-z", before, after])
     parts = status_out.decode("utf-8", "replace").split("\0")
@@ -264,13 +269,17 @@ def diff_trees(
 
     changes = [FileChange(p, kinds[p], *counts.get(p, (0, 0))) for p in order]
 
-    text, truncated = _git_head(
+    # Read a secret's length past the cap, so one that crosses the cap is whole when redacted.
+    margin = max((len(v) for v in redact if v), default=0)
+    text, more = _git_head(
         repo,
         _TREE_DIFF + ["-p", "--no-color", "--no-ext-diff", "--no-textconv", before, after],
-        max_chars,
+        max_chars + margin,
     )
+    text = _redact(text, redact)
+    truncated = more or len(text) > max_chars
     if truncated:
-        text += _TRUNC_NOTE
+        text = scrub_edge(text[:max_chars], redact, at_end=True) + _TRUNC_NOTE
     return changes, text, truncated
 
 

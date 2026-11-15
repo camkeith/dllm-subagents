@@ -158,7 +158,7 @@ class ChatClient:
             msg = choice["message"]
         except (ValueError, KeyError, IndexError, TypeError):
             raise LLMError("Provider returned an unreadable response: %s" % self._scrub(
-                raw.decode("utf-8", "replace")[:500]))
+                raw.decode("utf-8", "replace"))[:500])
         usage = data.get("usage") or {}
         calls: List[ToolCall] = []
         for item in msg.get("tool_calls") or []:

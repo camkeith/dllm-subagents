@@ -19,7 +19,7 @@ from .config import Limits
 from .llm import LLMError
 from .prompts import SYSTEM_PROMPT
 from .shell import run_command, truncate_middle
-from .tools import TOOL_SCHEMAS, ToolContext, ToolError, run_tool
+from .tools import TOOL_SCHEMAS, ToolContext, ToolError, run_tool, scrub_cuts
 from .tools import redact as _redact
 
 TOOL_RESULT_MAX_CHARS = 30_000
@@ -62,13 +62,13 @@ class _Stop(Exception):
         self.error = error
 
 
-def _label(name: str, args: dict) -> str:
+def _label(name: str, args: dict, scrub: Callable[[str], str]) -> str:
     hint = ""
     if isinstance(args, dict):
         for key in ("path", "command", "summary"):
             value = args.get(key)
             if isinstance(value, str) and value:
-                hint = value.splitlines()[0][:80]
+                hint = scrub(value.splitlines()[0])[:80]  # redact before cutting
                 break
     return "%s: %s" % (name, hint) if hint else name
 
@@ -165,6 +165,10 @@ class Agent:
     def _scrub(self, text: str) -> str:
         return _redact(text, self.redact)
 
+    def _scrub_output(self, text: str) -> str:
+        """Tool and check output: redact, then clear secret pieces that truncation left at cuts."""
+        return scrub_cuts(self._scrub(text), self.redact)
+
     def _scrub_message(self, message: dict) -> dict:
         # Stored copy only; tool calls still run with the model's raw arguments.
         return json.loads(self._scrub(json.dumps(message))) if self.redact else message
@@ -172,7 +176,7 @@ class Agent:
     def _tool_message(self, call_id: str, content: str) -> None:
         self.messages.append(
             {"role": "tool", "tool_call_id": call_id,
-             "content": truncate_middle(self._scrub(content), TOOL_RESULT_MAX_CHARS)}
+             "content": truncate_middle(self._scrub_output(content), TOOL_RESULT_MAX_CHARS)}
         )
 
     def _progress(self, label: str) -> None:
@@ -205,7 +209,7 @@ class Agent:
                 self._progress("%s: invalid arguments" % call.name)
                 self._tool_message(call.id, "Error: invalid JSON arguments: %s" % exc)
                 continue
-            self._progress(self._scrub(_label(call.name, args)))
+            self._progress(self._scrub(_label(call.name, args, self._scrub)))
             if call.name == "finish":
                 finished = True
                 pending_stop = self._handle_finish(call.id, args)
@@ -256,7 +260,7 @@ class Agent:
         except OSError as exc:
             self._tool_message(call_id, "Error: cannot run check command: %s" % exc)
             return _Stop("error", error="cannot run check command: %s" % (exc.strerror or exc))
-        output = self._scrub(res.output)
+        output = self._scrub_output(res.output)
         if res.timed_out:
             output += "\n[check timed out after %ds]" % self.check_timeout
         self.check = CheckResult(self.check_command, res.returncode, output[-CHECK_TAIL_CHARS:], attempts)

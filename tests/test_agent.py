@@ -293,6 +293,12 @@ SECRET = "sk-test-secret-123456"
 PRINT_SECRET = "printf 'sk-test-%s\\n' 'secret-123456'"
 
 
+def emit_secret(before, after):
+    """A command printing before + SECRET + after (Python expressions) whose text holds no piece of SECRET."""
+    return ("python3 -c \"import binascii,sys; k=binascii.unhexlify('%s').decode(); "
+            "sys.stdout.write(%s + k + %s)\"" % (SECRET.encode().hex(), before, after))
+
+
 class RedactTest(unittest.TestCase):
     setUp = AgentTest.setUp
     agent = AgentTest.agent
@@ -345,6 +351,45 @@ class RedactTest(unittest.TestCase):
         stored = self.client.calls[1][2]["tool_calls"][0]["function"]["arguments"]
         self.assertNotIn(SECRET, stored)
         self.assertIn("exit code: 0\n***", self.client.calls[1][-1]["content"])  # ran the raw command
+
+    def assert_no_fragment(self, *texts):
+        pieces = {SECRET[i:i + 8] for i in range(len(SECRET) - 7)}
+        for text in texts:
+            for piece in pieces:
+                self.assertNotIn(piece, text)
+
+    def test_no_key_fragment_at_shell_head_cut(self):
+        path = self.dir / "traj.json"
+        script = [tool_completion(("bash", {"command": emit_secret("'x'*4990", "'y'*20000")})), finish()]
+        self.agent(script, trajectory_path=path, redact=[SECRET]).run("task")
+        out = self.client.calls[1][-1]["content"]
+        self.assertIn("characters cut", out)
+        self.assertIn("x***\n... [", out)
+        self.assert_no_fragment(out, path.read_text())
+
+    def test_no_key_fragment_at_shell_tail_cut(self):
+        path = self.dir / "traj.json"
+        script = [tool_completion(("bash", {"command": emit_secret("'y'*20000", "'z'*4990")})), finish()]
+        self.agent(script, trajectory_path=path, redact=[SECRET]).run("task")
+        out = self.client.calls[1][-1]["content"]
+        self.assertIn("cut] ...\n***z", out)
+        self.assert_no_fragment(out, path.read_text())
+
+    def test_no_key_fragment_at_read_line_cut(self):
+        path = self.dir / "traj.json"
+        (self.workdir / "long.txt").write_text("x" * 1990 + SECRET + "y" * 100 + "\n")
+        script = [tool_completion(("read", {"path": "long.txt"})), finish()]
+        self.agent(script, trajectory_path=path, redact=[SECRET]).run("task")
+        out = self.client.calls[1][-1]["content"]
+        self.assertIn("x***... [line cut]", out)
+        self.assert_no_fragment(out, path.read_text())
+
+    def test_progress_label_redacted_before_cut(self):
+        seen = []
+        script = [tool_completion(("bash", {"command": "echo " + "x" * 65 + SECRET})), finish()]
+        self.agent(script, redact=[SECRET], on_step=lambda n, label: seen.append(label)).run("task")
+        self.assertEqual(seen[0], "bash: echo " + "x" * 65 + "***")
+        self.assert_no_fragment(*seen)
 
     def test_short_redact_values_ignored(self):
         script = [tool_completion(("bash", {"command": "echo short-ok"})), finish()]
