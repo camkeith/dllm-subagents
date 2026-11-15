@@ -121,7 +121,9 @@ class Agent:
                 self._step()
             except _Stop as exc:
                 stop = exc
-            finally:
+            except Exception as exc:  # run() never raises: any unexpected failure ends the run
+                stop = _Stop("error", error="%s: %s" % (type(exc).__name__, exc))
+            else:
                 self._save()
         return self._finish_run(stop)
 
@@ -285,6 +287,12 @@ class Agent:
         )
 
     def _save(self) -> None:
+        try:
+            self._write_trajectory()
+        except Exception:  # a failing trajectory write must not break the run
+            pass
+
+    def _write_trajectory(self) -> None:
         if self.trajectory_path is None:
             return
         path = Path(self.trajectory_path)

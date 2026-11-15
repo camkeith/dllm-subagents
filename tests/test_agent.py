@@ -165,6 +165,31 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(res.status, "error")
         self.assertIn("bad tools", res.error)
 
+    def test_unexpected_client_exception_ends_run(self):
+        path = self.dir / "traj.json"
+
+        def boom(messages):
+            raise AttributeError("'str' object has no attribute 'get'")
+
+        res = self.agent([boom], trajectory_path=path).run("task")
+        self.assertEqual(res.status, "error")
+        self.assertIn("AttributeError", res.error)
+        self.assertEqual(json.loads(path.read_text())["status"], "error")
+
+    def test_on_step_exception_ends_run(self):
+        def bad(n, label):
+            raise RuntimeError("callback broke")
+
+        res = self.agent([write("a.txt"), finish()], on_step=bad).run("task")
+        self.assertEqual(res.status, "error")
+        self.assertIn("RuntimeError: callback broke", res.error)
+
+    def test_trajectory_write_failure_does_not_break_run(self):
+        blocker = self.dir / "file"
+        blocker.write_text("x")
+        res = self.agent([finish()], trajectory_path=blocker / "traj.json").run("task")
+        self.assertEqual(res.status, "done")
+
     def test_cancel(self):
         def cancel_after(messages):
             self.cancel.set()
