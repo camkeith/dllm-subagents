@@ -13,13 +13,14 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Sequence
 
 from .config import Limits
 from .llm import LLMError
 from .prompts import SYSTEM_PROMPT
 from .shell import run_command, truncate_middle
 from .tools import TOOL_SCHEMAS, ToolContext, ToolError, run_tool
+from .tools import redact as _redact
 
 TOOL_RESULT_MAX_CHARS = 30_000
 CHECK_TAIL_CHARS = 4_000
@@ -86,6 +87,7 @@ class Agent:
         on_step: Optional[Callable[[int, str], None]] = None,
         trajectory_path: Optional[Path] = None,
         clock: Callable[[], float] = time.monotonic,
+        redact: Sequence[str] = (),
     ):
         self.client = client
         self.ctx = ctx
@@ -97,6 +99,7 @@ class Agent:
         self.on_step = on_step
         self.trajectory_path = trajectory_path
         self.clock = clock
+        self.redact = tuple(redact)  # secret values scrubbed from everything the model or result sees
         self.messages: List[dict] = []
         self.steps = 0
         self.input_tokens = 0
@@ -113,7 +116,7 @@ class Agent:
         self._start = self.clock()
         self.messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": task_message},
+            {"role": "user", "content": self._scrub(task_message)},
         ]
         stop: Optional[_Stop] = None
         while stop is None:
@@ -144,7 +147,7 @@ class Agent:
             raise _Stop("error", error=str(exc))
         self.input_tokens += completion.input_tokens
         self.output_tokens += completion.output_tokens
-        self.messages.append(completion.message)
+        self.messages.append(self._scrub_message(completion.message))
         return completion
 
     def _check_cancel(self) -> None:
@@ -159,9 +162,17 @@ class Agent:
         if self.input_tokens + self.output_tokens >= self.limits.max_tokens_total:
             raise _Stop("limit_reached", limit="max_tokens_total")
 
+    def _scrub(self, text: str) -> str:
+        return _redact(text, self.redact)
+
+    def _scrub_message(self, message: dict) -> dict:
+        # Stored copy only; tool calls still run with the model's raw arguments.
+        return json.loads(self._scrub(json.dumps(message))) if self.redact else message
+
     def _tool_message(self, call_id: str, content: str) -> None:
         self.messages.append(
-            {"role": "tool", "tool_call_id": call_id, "content": truncate_middle(content, TOOL_RESULT_MAX_CHARS)}
+            {"role": "tool", "tool_call_id": call_id,
+             "content": truncate_middle(self._scrub(content), TOOL_RESULT_MAX_CHARS)}
         )
 
     def _progress(self, label: str) -> None:
@@ -194,7 +205,7 @@ class Agent:
                 self._progress("%s: invalid arguments" % call.name)
                 self._tool_message(call.id, "Error: invalid JSON arguments: %s" % exc)
                 continue
-            self._progress(_label(call.name, args))
+            self._progress(self._scrub(_label(call.name, args)))
             if call.name == "finish":
                 finished = True
                 pending_stop = self._handle_finish(call.id, args)
@@ -232,7 +243,7 @@ class Agent:
         if not isinstance(summary, str) or not summary.strip():
             self._tool_message(call_id, "Error: finish requires a non-empty 'summary' string. Call finish again with one.")
             return None
-        self.summary = summary
+        self.summary = self._scrub(summary)
         if not self.check_command:
             self._tool_message(call_id, "Finished.")
             return _Stop("done")
@@ -245,7 +256,7 @@ class Agent:
         except OSError as exc:
             self._tool_message(call_id, "Error: cannot run check command: %s" % exc)
             return _Stop("error", error="cannot run check command: %s" % (exc.strerror or exc))
-        output = res.output
+        output = self._scrub(res.output)
         if res.timed_out:
             output += "\n[check timed out after %ds]" % self.check_timeout
         self.check = CheckResult(self.check_command, res.returncode, output[-CHECK_TAIL_CHARS:], attempts)

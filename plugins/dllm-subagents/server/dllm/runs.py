@@ -13,18 +13,19 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence
 
 from . import shell, snapshot
 from .agent import Agent, AgentResult
 from .config import ConfigError, Profile, Settings, clamp_limits, resolve_api_key
 from .llm import ChatClient
 from .prompts import build_task_message, load_files
-from .tools import ToolContext, scrubbed_env
+from .tools import ToolContext, redact, scrubbed_env
 
 CANCEL_WAIT_SECONDS = 5.0
 SHUTDOWN_GRACE_SECONDS = 5.0
 LOCK_NAME = "dllm-subagents.lock"
+PASSED_CHECK_TAIL_LINES = 5
 _POLL = 0.05
 _RUN_ID = re.compile(r"\d{8}-\d{6}-[0-9a-f]{6}")
 _UNDO_OWNER = "undo:"
@@ -102,6 +103,23 @@ class _Run:
 
     def on_step(self, step: int, label: str) -> None:
         self.progress = (step, label)
+
+
+def _undone_on_disk(path: Path) -> bool:
+    try:
+        return RunRecord.load(path).undone
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _error_view(run: _Run, error: str) -> dict:
+    """Minimal finished view for when the normal one could not be built."""
+    return {
+        "status": "error", "run_id": run.record.run_id, "summary": "", "limit": None,
+        "error": error, "check": None, "stats": {}, "changed_files": None, "diff": "",
+        "diff_truncated": False, "log_path": str(run.log_path),
+        "before_tree": run.record.before_tree, "after_tree": None,
+    }
 
 
 def _new_run_id() -> str:
@@ -204,6 +222,13 @@ class RunManager:
         message = build_task_message(task, workdir, check_command, loaded, notes)
         client = self._client_factory(profile, key, model)
         secret_names = [p.api_key_env for p in self.settings.profiles.values()]
+        known_keys = [key]
+        for other in self.settings.profiles.values():
+            if other is not profile:
+                try:
+                    known_keys.append(resolve_api_key(other))
+                except ConfigError:
+                    pass
 
         run_id = _new_run_id()
         lock = self._acquire(repo, run_id)
@@ -221,7 +246,7 @@ class RunManager:
             ctx = ToolContext(workdir=Path(workdir), cancel_event=run.cancel_event,
                               env=scrubbed_env(secret_names))
             agent = Agent(client, ctx, limits, check_command=check_command,
-                          on_step=run.on_step, trajectory_path=run.log_path)
+                          on_step=run.on_step, trajectory_path=run.log_path, redact=known_keys)
             thread = threading.Thread(target=self._work, args=(run, agent, message),
                                       name="dllm-run-" + run_id, daemon=True)
             with self._lock:
@@ -298,6 +323,9 @@ class RunManager:
             )
         lock = self._acquire(Path(record.repo), _UNDO_OWNER + run_id)
         try:
+            if _undone_on_disk(path):  # another session undid it since we read the record
+                record.undone = True
+                raise RunError("run %s was already undone" % run_id)
             try:
                 snapshot.undo(Path(record.repo), record.before_tree, record.after_tree,
                               protect=record.ignored)
@@ -368,15 +396,16 @@ class RunManager:
             crash = "%s: %s" % (type(exc).__name__, exc)
         finally:
             try:
-                self._finish(run, result, crash)
+                self._finish(run, result, crash, agent.redact)
             except Exception as exc:  # never leave a finished run without a view
-                run.view = self._final_view(run, "error", result, "internal error finishing the run: "
-                                            "%s: %s" % (type(exc).__name__, exc), None, "", False)
+                run.view = _error_view(run, redact("internal error finishing the run: %s: %s"
+                                                   % (type(exc).__name__, exc), agent.redact))
             finally:
                 self._release(run.lock)
                 run.done.set()
 
-    def _finish(self, run: _Run, result: Optional[AgentResult], crash: Optional[str]) -> None:
+    def _finish(self, run: _Run, result: Optional[AgentResult], crash: Optional[str],
+                keys: Sequence[str]) -> None:
         rec = run.record
         repo = Path(rec.repo)
         status = result.status if result is not None else "error"
@@ -394,18 +423,19 @@ class RunManager:
                 changes, diff, truncated = snapshot.diff_trees(repo, rec.before_tree, after)
             except Exception as exc:
                 errors.append("could not compute the diff: %s" % exc)
+        diff = redact(diff, keys)  # a deleted or edited file may have held a key
         with run.save_lock:
             rec.after_tree = after
             rec.status = status
             rec.ended_at = time.time()
-            rec.error = "; ".join(errors) or None
+            rec.error = redact("; ".join(errors), keys) or None
             try:
                 rec.save(run.record_path)
                 run.final_saved = True
-            except OSError as exc:
+            except Exception as exc:
                 errors.append("could not save the run record, so undo will not work after a "
                               "restart: %s" % exc)
-        run.view = self._final_view(run, status, result, "; ".join(errors) or None,
+        run.view = self._final_view(run, status, result, redact("; ".join(errors), keys) or None,
                                     changes, diff, truncated)
 
     def _final_view(self, run: _Run, status: str, result: Optional[AgentResult], error: Optional[str],
@@ -474,8 +504,8 @@ class RunManager:
         raise RunError("unknown run_id %r" % (run_id,))
 
     def _view(self, run: _Run) -> dict:
-        if run.done.is_set() and run.view is not None:
-            return dict(run.view)
+        if run.done.is_set():
+            return dict(run.view or _error_view(run, "the run ended without a result"))
         step, label = run.progress
         elapsed = int(time.monotonic() - run.started)
         if step:
@@ -507,9 +537,13 @@ def render_view(view: dict) -> str:
     if check:
         lines.append("check: `%s` exit code %d (attempt %d)"
                      % (check["command"], check["exit_code"], check["attempts"]))
-        if check["exit_code"] != 0 and check.get("output_tail"):
+        tail = (check.get("output_tail") or "").rstrip("\n")
+        if tail and check["exit_code"] != 0:
             lines.append("check output (tail):")
-            lines.append(check["output_tail"].rstrip("\n"))
+            lines.append(tail)
+        elif tail:
+            lines.append("check output (last %d lines):" % PASSED_CHECK_TAIL_LINES)
+            lines.extend(tail.splitlines()[-PASSED_CHECK_TAIL_LINES:])
     s = view.get("stats") or {}
     lines.append("stats: %d steps, %.1f s, tokens %d in / %d out, %s/%s" % (
         s.get("steps", 0), s.get("seconds", 0.0), s.get("input_tokens", 0),

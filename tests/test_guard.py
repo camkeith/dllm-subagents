@@ -4,6 +4,7 @@ import os
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from dllm.guard import READONLY_GIT, check_command
@@ -101,6 +102,20 @@ class GuardTest(unittest.TestCase):
         with self.assertRaises(ToolError) as cm:
             run_tool("bash", {"command": "git push"}, ctx)
         self.assertTrue(str(cm.exception).startswith("blocked: git push is not allowed"))
+
+    def test_blocks_key_file(self):
+        for cmd in ("cat ~/.config/dllm-subagents/keys.env",
+                    "cat $DLLM_SUBAGENTS_CONFIG_DIR/keys.env",
+                    "grep KEY keys.env", "echo ok && cat ${HOME}/x/keys.env | head", "cat 'keys.env"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(check_command(cmd, self.workdir), "reading the plugin's key file is not allowed")
+
+    def test_blocks_resolved_config_dir(self):
+        cfg = os.path.join(self.workdir, "cfgdir")
+        with mock.patch.dict(os.environ, {"DLLM_SUBAGENTS_CONFIG_DIR": cfg}):
+            self.assertEqual(check_command("cat %s/secrets.txt" % cfg, self.workdir),
+                             "reading the plugin's key file is not allowed")
+            self.assertIsNone(check_command("cat notes.txt", self.workdir))
 
     def test_explicit_none_disables_guard(self):
         ctx = ToolContext(Path(self.workdir), threading.Event(), guard=None)

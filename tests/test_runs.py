@@ -670,6 +670,121 @@ class RunsTest(unittest.TestCase):
             self.assertNotIn(SECRET, text)
             self.assertNotIn(OTHER_SECRET, text)
 
+    def test_keys_in_repo_files_are_redacted(self):
+        # The other provider's key is only in keys.env, so it must come from resolve_api_key.
+        del os.environ[OTHER_ENV]
+        cfg = Path(os.environ["DLLM_SUBAGENTS_CONFIG_DIR"])
+        cfg.mkdir()
+        (cfg / "keys.env").write_text("%s=%s\n" % (OTHER_ENV, OTHER_SECRET))
+        (self.repo / "creds.txt").write_text("A=%s\nB=%s\n" % (SECRET, OTHER_SECRET))
+        git(self.repo, "add", "creds.txt")
+        git(self.repo, "commit", "-q", "-m", "creds")
+        m = self.manager([bash("cat creds.txt"), bash("rm creds.txt"), finish("removed creds")])
+        rid = m.start("t", workdir=str(self.repo), check_command="git show HEAD:creds.txt")
+        view = m.wait(rid, 20)
+        self.assertEqual(view["status"], "done")
+        self.assertIn("A=***", self.clients[0].calls[1][-1]["content"])  # the model saw *** only
+        self.assertEqual([(f["path"], f["change"]) for f in view["changed_files"]], [("creds.txt", "deleted")])
+        self.assertIn("-A=***", view["diff"])
+        self.assertIn("A=***", view["check"]["output_tail"])
+        texts = [
+            (self.runs_path / (rid + ".json")).read_text(),
+            Path(view["log_path"]).read_text(),
+            json.dumps(view),
+            render_view(view),
+        ]
+        for text in texts:
+            self.assertNotIn(SECRET, text)
+            self.assertNotIn(OTHER_SECRET, text)
+
+    def test_bash_cannot_read_key_file(self):
+        m = self.manager([bash("cat $DLLM_SUBAGENTS_CONFIG_DIR/keys.env"), finish()])
+        rid = m.start("t", workdir=str(self.repo))
+        self.assertEqual(m.wait(rid, 20)["status"], "done")
+        out = self.clients[0].calls[1][-1]["content"]
+        self.assertIn("reading the plugin's key file is not allowed", out)
+
+    # -- finish hardening ------------------------------------------------------------
+
+    def test_finish_failure_gives_error_view(self):
+        m = self.manager([finish()], [finish()])
+        with mock.patch.object(RunManager, "_final_view", side_effect=RuntimeError("view boom")):
+            rid = m.start("t", workdir=str(self.repo))
+            view = m.wait(rid, 20)
+        self.assertEqual(view["status"], "error")
+        self.assertIn("view boom", view["error"])
+        self.assertIn("status: error", render_view(view))
+        self.assertEqual(m.wait(rid, 0)["status"], "error")  # stays finished, never "running"
+        rid2 = m.start("t", workdir=str(self.repo))  # lock released
+        self.assertEqual(m.wait(rid2, 20)["status"], "done")
+
+    def test_done_without_view_reports_error(self):
+        m = self.manager([finish()])
+        rid = m.start("t", workdir=str(self.repo))
+        m.wait(rid, 20)
+        m._runs[rid].view = None  # simulate a worker that died before building its view
+        view = m.wait(rid, 0)
+        self.assertEqual(view["status"], "error")
+        self.assertIn("status: error", render_view(view))
+
+    def test_record_save_failure_is_reported(self):
+        real_save = RunRecord.save
+        calls = []
+
+        def save(rec, path):
+            calls.append(rec.status)
+            if rec.status != "running":
+                raise TypeError("not serializable")
+            return real_save(rec, path)
+
+        m = self.manager([finish()])
+        with mock.patch.object(RunRecord, "save", save):
+            rid = m.start("t", workdir=str(self.repo))
+            view = m.wait(rid, 20)
+        self.assertEqual(view["status"], "done")
+        self.assertIn("could not save the run record", view["error"])
+
+    def test_snapshot_failure_after_lock_releases_it(self):
+        def boom(*args, **kw):
+            raise snapshot.SnapshotError("snap boom")
+
+        m = self.manager([finish()], [finish()], [finish()])  # each start builds a client
+        for name in ("snapshot_tree", "ignored_paths"):
+            with self.subTest(name=name):
+                with mock.patch.object(snapshot, name, boom):
+                    with self.assertRaises(RunError) as cm:
+                        m.start("t", workdir=str(self.repo))
+                self.assertIn("snap boom", str(cm.exception))
+                self.assert_no_run_started()
+        rid = m.start("t", workdir=str(self.repo))  # neither lock was left behind
+        self.assertEqual(m.wait(rid, 20)["status"], "done")
+
+    def test_undo_rechecks_record_under_lock(self):
+        m = self.manager([write("new.txt"), finish()])
+        rid = m.start("t", workdir=str(self.repo))
+        self.assertEqual(m.wait(rid, 20)["status"], "done")
+        m2 = RunManager(settings(), client_factory=lambda p, k, mo: FakeClient([]))
+        self.addCleanup(m2.shutdown)
+        m2.undo(rid)  # another session undoes it; m still holds the old in-memory record
+        with self.assertRaises(RunError) as cm:
+            m.undo(rid)
+        self.assertIn("already undone", str(cm.exception))
+
+    def test_render_passing_check_shows_last_lines(self):
+        view = {
+            "status": "done", "run_id": "20261115-120000-abcdef", "summary": "ok", "limit": None,
+            "error": None,
+            "check": {"command": "pytest -q", "exit_code": 0, "attempts": 1,
+                      "output_tail": "".join("line%d\n" % i for i in range(1, 9))},
+            "stats": {}, "changed_files": [], "diff": "", "diff_truncated": False,
+            "log_path": "", "before_tree": "a" * 40, "after_tree": "a" * 40,
+        }
+        text = render_view(view)
+        self.assertIn("check output (last 5 lines):", text)
+        for i in range(4, 9):
+            self.assertIn("line%d" % i, text)
+        self.assertNotIn("line3", text)
+
     # -- records and runs dir --------------------------------------------------------
 
     def test_record_roundtrip(self):

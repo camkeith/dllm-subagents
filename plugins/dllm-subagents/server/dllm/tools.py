@@ -95,6 +95,17 @@ def scrubbed_env(names: Iterable[str], base: Optional[Mapping[str, str]] = None)
     return {k: v for k, v in (os.environ if base is None else base).items() if k not in drop}
 
 
+REDACT_MIN_CHARS = 8
+
+
+def redact(text: str, values: Iterable[str]) -> str:
+    """Replace each secret value (8+ chars; shorter ones are ignored) in text with ***."""
+    for value in values:
+        if value and len(value) >= REDACT_MIN_CHARS:
+            text = text.replace(value, "***")
+    return text
+
+
 def resolve_in_workdir(workdir: Path, path: str) -> Path:
     root = Path(os.path.realpath(str(workdir)))
     target = Path(os.path.realpath(os.path.join(str(root), path)))

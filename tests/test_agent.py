@@ -288,5 +288,69 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(len(first), 2)
 
 
+SECRET = "sk-test-secret-123456"
+# Prints SECRET without the command text containing it, so assistant messages stay clean.
+PRINT_SECRET = "printf 'sk-test-%s\\n' 'secret-123456'"
+
+
+class RedactTest(unittest.TestCase):
+    setUp = AgentTest.setUp
+    agent = AgentTest.agent
+
+    def test_redacts_tool_output_summary_and_trajectory(self):
+        path = self.dir / "traj.json"
+        script = [
+            tool_completion(("bash", {"command": PRINT_SECRET})),
+            tool_completion(("read", {"path": "creds.txt"})),
+            finish("found " + SECRET),
+        ]
+        (self.workdir / "creds.txt").write_text("KEY=%s\n" % SECRET)
+        res = self.agent(script, trajectory_path=path, redact=[SECRET]).run("task")
+        self.assertEqual(res.status, "done")
+        bash_out = self.client.calls[1][-1]["content"]
+        read_out = self.client.calls[2][-1]["content"]
+        self.assertIn("***", bash_out)
+        self.assertIn("KEY=***", read_out)
+        self.assertEqual(res.summary, "found ***")
+        traj = path.read_text()
+        self.assertIn("***", traj)
+        for text in (bash_out, read_out, traj, repr(res)):
+            self.assertNotIn(SECRET, text)
+
+    def test_redacts_check_output(self):
+        path = self.dir / "traj.json"
+        res = self.agent([finish()], trajectory_path=path, redact=[SECRET], max_check_failures=1,
+                         check_command=PRINT_SECRET + "; exit 1").run("task")
+        self.assertEqual(res.status, "check_failed")
+        self.assertIn("***", res.check.output_tail)
+        self.assertNotIn(SECRET, res.check.output_tail)
+        traj = path.read_text()
+        self.assertIn("***", traj)  # the failed-check tool message
+        self.assertNotIn(SECRET, traj)
+
+    def test_redacts_passing_check_output(self):
+        res = self.agent([finish()], redact=[SECRET], check_command=PRINT_SECRET).run("task")
+        self.assertEqual(res.status, "done")
+        self.assertEqual(res.check.output_tail.strip(), "***")
+
+    def test_redacts_task_message(self):
+        self.agent([finish()], redact=[SECRET]).run("file says " + SECRET)
+        self.assertEqual(self.client.calls[0][1]["content"], "file says ***")
+
+    def test_redacts_progress_label_and_stored_assistant_message(self):
+        seen = []
+        script = [tool_completion(("bash", {"command": "echo " + SECRET})), finish()]
+        self.agent(script, redact=[SECRET], on_step=lambda n, label: seen.append(label)).run("task")
+        self.assertEqual(seen[0], "bash: echo ***")
+        stored = self.client.calls[1][2]["tool_calls"][0]["function"]["arguments"]
+        self.assertNotIn(SECRET, stored)
+        self.assertIn("exit code: 0\n***", self.client.calls[1][-1]["content"])  # ran the raw command
+
+    def test_short_redact_values_ignored(self):
+        script = [tool_completion(("bash", {"command": "echo short-ok"})), finish()]
+        self.agent(script, redact=["short", "", "ok"]).run("task")
+        self.assertIn("short-ok", self.client.calls[1][-1]["content"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -12,6 +12,9 @@ import re
 import shlex
 from typing import List, Optional, Tuple
 
+from .config import config_dir
+
+KEY_FILE_REASON = "reading the plugin's key file is not allowed"
 READONLY_GIT = frozenset({"status", "diff", "log", "show", "ls-files", "grep", "blame", "rev-parse"})
 
 _MAX_DEPTH = 6
@@ -318,6 +321,8 @@ def check_command(command: str, workdir: str) -> Optional[str]:
     try:
         if not isinstance(command, str):
             return _parse_error("not a string")
+        if "keys.env" in command or str(config_dir()) in command:
+            return KEY_FILE_REASON
         return _check(command, workdir, 0, os.path.realpath(workdir))
     except Exception as exc:  # the guard must never take the run down
         return _parse_error(type(exc).__name__)
