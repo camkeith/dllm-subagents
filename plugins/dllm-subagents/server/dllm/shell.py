@@ -18,6 +18,7 @@ from typing import Dict, Optional
 # Seconds to keep collecting output after the shell exits while a background
 # child still holds the output pipe, before the leftovers are killed.
 _BACKGROUND_GRACE = 1.0
+_POLL_FIRST = 0.002  # poll fast at first so short commands return quickly, backing off to _POLL
 _POLL = 0.05
 
 _live: Dict[int, threading.Event] = {}
@@ -146,6 +147,7 @@ def run_command(
     collector: Optional[_Collector] = None
     timed_out = cancelled = False
     deadline = time.monotonic() + timeout
+    poll = _POLL_FIRST
     try:
         collector = _Collector(proc.stdout, max_output_chars)
         while not _exited(proc):
@@ -155,7 +157,8 @@ def run_command(
             if time.monotonic() >= deadline:
                 timed_out = True
                 break
-            time.sleep(_POLL)
+            time.sleep(poll)
+            poll = min(poll * 2, _POLL)
         if not (timed_out or cancelled):
             # Shell exited; let a background child holding the pipe finish
             # briefly, but no longer.

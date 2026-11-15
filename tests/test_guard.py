@@ -94,6 +94,17 @@ class GuardTest(unittest.TestCase):
         self.assertIsNotNone(check_command("rm -rf " + str(Path(self.workdir).parent), self.workdir))
         self.assertIsNone(check_command("rm -rf " + os.path.join(self.workdir, "build"), self.workdir))
 
+    def test_rm_variable_targets_blocked(self):
+        for cmd in ("rm -rf $DIR/*", 'rm -rf "$BUILD"/out', "rm -rf ${OUT}", "rm -r $(pwd)/build",
+                    "rm -rf `pwd`/x", "cd sub && rm -rf $T"):
+            with self.subTest(cmd=cmd):
+                reason = check_command(cmd, self.workdir)
+                self.assertIsNotNone(reason)
+                self.assertIn("variable or command substitution", reason)
+        for cmd in ("rm -rf build", "rm -rf ./dist", "rm $F", "rm -f $F", "cd sub && rm -rf build"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(check_command(cmd, self.workdir))
+
     def test_tools_use_guard_by_default(self):
         self.assertIs(ToolContext(Path(self.workdir), threading.Event()).guard, check_command)
 

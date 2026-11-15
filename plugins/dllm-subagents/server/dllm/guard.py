@@ -222,6 +222,9 @@ def _rm_reason(args: List[str], workdir: str, cwd: Optional[str]) -> Optional[st
     for t in targets:
         if t in _ROOTISH or t.startswith("~/") or t.startswith("$HOME/") or t.startswith("${HOME}/") or t == "~":
             return "recursive rm of %s is not allowed (only paths inside the working directory)" % t
+        if "$" in t or "`" in t:
+            return ("recursive rm of %s is not allowed (a variable or command substitution can expand "
+                    "to anything, even to nothing; name the path literally)" % t)
         if cwd is None and not os.path.isabs(t):
             return "recursive rm of %s is not allowed (the directory after cd is unknown; use paths inside the working directory)" % t
         path = os.path.realpath(os.path.join(cwd or root, t))

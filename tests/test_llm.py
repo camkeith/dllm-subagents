@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import unittest
 
@@ -123,6 +124,13 @@ class ChatClientTests(unittest.TestCase):
         fake = Fake(OSError("boom"), ok({"role": "assistant", "content": "x"}))
         client, sleeps = make(fake)
         self.assertEqual(client.complete(MSGS, TOOLS).content, "x")
+        self.assertEqual(len(sleeps), 1)
+
+    def test_retries_truncated_response(self):
+        fake = Fake(http.client.IncompleteRead(b"partial", 100), ok({"role": "assistant", "content": "x"}))
+        client, sleeps = make(fake)
+        self.assertEqual(client.complete(MSGS, TOOLS).content, "x")
+        self.assertEqual(len(fake.requests), 2)
         self.assertEqual(len(sleeps), 1)
 
     def test_gives_up_after_max_retries(self):

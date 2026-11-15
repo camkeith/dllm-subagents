@@ -191,6 +191,21 @@ class SnapshotTests(unittest.TestCase):
         self.assertIn("a.txt", str(cm.exception))
         self.assertEqual((repo / "a.txt").read_text(), "totally different\n")
 
+    def test_undo_after_gc_pruned_snapshots(self):
+        repo = make_repo(self.tmp)
+        before = snapshot_tree(repo)
+        (repo / "a.txt").write_text("changed\n")
+        after = snapshot_tree(repo)
+        loose = git_path(repo, "objects") / after[:2] / after[2:]
+        self.assertTrue(loose.exists())
+        loose.unlink()  # what git gc does to an unreferenced snapshot tree
+        for b, a in ((before, after), (before, "1" * 40), ("1" * 40, before)):
+            with self.assertRaises(SnapshotError) as cm:
+                undo(repo, b, a)
+            self.assertEqual(str(cm.exception),
+                             "the run's snapshots were pruned by git gc; undo is no longer possible")
+        self.assertEqual((repo / "a.txt").read_text(), "changed\n")
+
     def test_undo_noop_when_same(self):
         repo = make_repo(self.tmp)
         t = snapshot_tree(repo)
@@ -355,6 +370,28 @@ class SnapshotTests(unittest.TestCase):
         self.assertNotIn("hunter2", text)
         undo(repo, before, after, protect=ign)
         self.assertEqual((repo / ".env").read_text(), "SECRET_KEY=hunter2\n")
+
+    def test_backstop_survives_file_changing_after_add(self):
+        import dllm.snapshot as snap
+
+        repo = self._drift({".gitignore": ".env\n", ".env": "SECRET_KEY=hunter2\n"})
+        run_git(repo, "add", ".gitignore")
+        before = snapshot_tree(repo)
+        ign = ignored_paths(repo)
+        (repo / ".gitignore").write_text("!.env\n")
+        real = snap._git
+
+        def racing(r, args, *rest, **kw):
+            out = real(r, args, *rest, **kw)
+            if "add" in args:  # the run rewrites the file between git add and the backstop
+                (repo / ".env").write_text("SECRET_KEY=rotated\n")
+            return out
+
+        with mock.patch.object(snap, "_git", racing):
+            after = snapshot_tree(repo, exclude=ign)
+        changes, text, _ = diff_trees(repo, before, after)
+        self.assertEqual([c.path for c in changes], [".gitignore"])
+        self.assertNotIn("SECRET_KEY", text)
 
     def test_trailing_space_filename(self):
         repo = self._drift({".gitignore": "*.tmp*\n", "a.tmp  ": "t\n"})

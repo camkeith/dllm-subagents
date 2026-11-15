@@ -111,6 +111,13 @@ class RunCommandTests(unittest.TestCase):
         self.assertLess(time.time() - start, 2)
         self.assertTrue(out[0].cancelled)
 
+    def test_quick_command_returns_quickly(self):
+        run_command("true", os.getcwd(), 10)  # warm up
+        start = time.monotonic()
+        for _ in range(10):
+            run_command("true", os.getcwd(), 10)
+        self.assertLess((time.monotonic() - start) / 10, 0.030)
+
     def test_cwd(self):
         with tempfile.TemporaryDirectory() as d:
             r = run_command("pwd", d, 10)

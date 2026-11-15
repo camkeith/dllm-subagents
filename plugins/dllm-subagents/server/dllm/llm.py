@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import time
 import urllib.error
@@ -128,7 +129,7 @@ class ChatClient:
             except ValueError:
                 # e.g. an invalid header value; never echo the text, it may hold the key
                 raise LLMError("Request could not be sent (invalid request data, check the API key format)")
-            except OSError as exc:  # URLError and timeouts are OSErrors
+            except (OSError, http.client.HTTPException) as exc:  # URLError, timeouts, cut-off bodies
                 status, raw = None, b""
                 failure = "Network error contacting provider: %s" % self._scrub(str(exc))
             else:

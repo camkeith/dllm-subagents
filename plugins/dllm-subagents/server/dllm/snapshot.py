@@ -232,7 +232,7 @@ def snapshot_tree(repo: Path, exclude: Sequence[str] = ()) -> str:
                     fh.write(p.encode("utf-8", "surrogateescape") + b"\0")
             _git(
                 repo,
-                ["rm", "--cached", "-r", "-q", "--ignore-unmatch",
+                ["rm", "--cached", "-f", "-r", "-q", "--ignore-unmatch",
                  "--pathspec-from-file=" + lst, "--pathspec-file-nul"],
                 env=dict(env, GIT_LITERAL_PATHSPECS="1"),
             )
@@ -297,10 +297,17 @@ def _protected(path: str, protect: Sequence[str]) -> bool:
     return False
 
 
+def _trees_exist(repo: Path, shas: Sequence[str]) -> bool:
+    out = _git(repo, ["cat-file", "--batch-check"], input="".join(s + "^{tree}\n" for s in shas).encode())
+    return not any(line.endswith(" missing") for line in out.decode("utf-8", "replace").splitlines())
+
+
 def undo(repo: Path, before: str, after: str, protect: Sequence[str] = ()) -> None:
     if before == after:
         return
     repo = repo_root(repo)
+    if not _trees_exist(repo, (before, after)):
+        raise SnapshotError("the run's snapshots were pruned by git gc; undo is no longer possible")
     if protect:
         names = _git(repo, _TREE_DIFF + ["--name-only", "-z", after, before])
         hit = [n for n in names.decode("utf-8", "replace").split("\0") if n and _protected(n, protect)]
