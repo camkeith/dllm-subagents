@@ -33,6 +33,7 @@ Put in `task`: the goal, constraints, existing patterns to follow (name the file
 - Before delegating, make sure dependency and build directories (`node_modules`, `.venv`, `dist`, `build`) are git-ignored, especially in a fresh `git init` repo. Otherwise every file the run installs or builds is snapshotted and listed as a change.
 - Pass `files` for paths you already know are relevant; their contents are given to the subagent up front.
 - Pass `check_command` whenever one exists (for example `pytest tests/test_api.py`). The harness runs it after the subagent finishes and lets the subagent fix failures a few times.
+- Tokens and other secret-looking environment variables are removed from the subagent's shell and check command. If a command needs one (for example `NPM_TOKEN`), the user must list it in `pass_env` in the plugin's `config.json`.
 - Optional: `provider` and `model` override the configured defaults; `max_steps` (1 to 150) and `max_seconds` (10 to 1800) override limits.
 
 ## Running it
@@ -66,5 +67,5 @@ Long results are cut. A cut diff ends with a `git diff <before> <after>` command
 
 ## While a run is active
 
-- Do not edit files in that `workdir`: your edits would show up in the run's diff and `fast_agent_undo` would revert them. Work elsewhere or wait.
+- Do not edit files anywhere in that repository, not only in `workdir`: snapshots and undo cover the whole repo, even when `workdir` is a subdirectory. Your edits would show up in the run's diff and `fast_agent_undo` would revert them. Work elsewhere or wait.
 - Only one run per repo or worktree at a time. For parallel runs, create separate git worktrees and pass each as its own `workdir`.

@@ -87,7 +87,7 @@ Example `~/.config/dllm-subagents/config.json`:
 
 Any OpenAI-compatible chat completions endpoint works (a local vLLM or Ollama, for example). Use it with `provider: "local"` or by setting it as `default_provider`.
 
-Give a `base_url` you add an `https://` address unless it is on your own machine. The key travels in the `Authorization` header, and urllib follows redirects and sends that header again to the new address.
+Give a `base_url` you add an `https://` address unless it is on your own machine. The key travels in the `Authorization` header. Redirects are not followed, so the key is never sent on to another address: a provider that redirects gets an error naming the new host, and you set `base_url` to the final address.
 
 The Cerebras free trial (5 requests per minute on gpt-oss-120b) is too slow for an agent loop; use pay-as-you-go.
 
@@ -109,13 +109,20 @@ The subagent's `bash` runs as you, in your repo, outside the permission prompts 
 - `shutdown`, `reboot`, `poweroff`, or `halt`
 - `keys.env`, or the full path of the plugin's config directory, anywhere in it (a `~/...` spelling of that path is not caught)
 
+The subagent's `bash` and the check command get your environment minus anything that looks secret. The provider key variables are always removed. So are variables whose names match, ignoring case, `*_API_KEY`, `*_APIKEY`, `*_KEY`, `*_TOKEN`, `*_SECRET`, `*_SECRET_*`, `*SECRET_KEY*`, `*PASSWORD*`, `*_PASS`, `*_PWD`, `*PASSPHRASE*`, `*CREDENTIAL*`, `*_DSN`, `*_PAT`, `*_AUTH`, `AWS_*` (except `AWS_REGION`, `AWS_DEFAULT_REGION` and `AWS_PROFILE`), `ANTHROPIC_*`, `OPENAI_*`, `GITHUB_TOKEN`, `GH_TOKEN` or `SSH_AUTH_SOCK`, plus `CDPATH`, `ENV` and `BASH_ENV`, and any variable whose value is a URL with a password in it (`scheme://user:password@host`, as in many `DATABASE_URL`s). `PATH`, `HOME`, `USER`, `SHELL`, `LANG`, `LC_*`, `TERM`, `TMPDIR` and `PWD` are always kept. If a build or test command needs one of the removed variables (an `NPM_TOKEN` for a private registry, for example), list it in `config.json` as `"pass_env": ["NPM_TOKEN"]`. Provider keys are removed even when listed there.
+
 These are **not a security boundary.** The subagent has network access and can read files outside the repo through bash, and a deliberately encoded read (base64, for example) can get around key redaction. Do not point it at untrusted repos. The file tools (`read`, `write`, `edit`) are confined to the repo, and `write` and `edit` refuse paths inside a `.git` directory.
 
 ## Snapshots and undo
 
 - The repo must be a git repo (`git init` if it is not).
 - Snapshots never touch your index, HEAD, refs, or stash.
+- While a run is active, do not edit files anywhere in its repository, in your own editor or otherwise. Snapshots and undo cover the whole repo, even when `workdir` is a subdirectory, so your edits would show up in the run's diff and `fast_agent_undo` would revert them.
 - Files ignored by git before the run are never deleted by undo, and changes the run makes to them are not tracked.
+- Edits inside nested git repositories (an untracked directory with its own `.git`) or inside submodules are not tracked: they are not in the diff, and undo does not revert them. The result names any nested repository it left out.
+- Files marked skip-worktree, including files outside a sparse checkout, are snapshotted as the index has them, so edits the run makes to them are not tracked.
+- Undo is all or nothing: if applying the revert fails partway, the files it touched are put back as they were.
+- With `core.autocrlf` or a `text=auto` attribute, undo restores each file's content, but its line endings follow git's normalization, not necessarily what was on disk before the run.
 - Make sure dependency and build directories (`node_modules`, `.venv`, `dist`, `build`) are git-ignored, especially in a fresh `git init` repo. A run that creates huge numbers of files git does not ignore makes snapshots slow, and the result then lists only 100 files plus a `git diff --stat` command for the rest.
 - One active run per repo or worktree, enforced across sessions.
 - Run records and logs live in `$DLLM_SUBAGENTS_RUNS_DIR` when it is set, else in the plugin data directory, or `~/.cache/dllm-subagents/runs` when there is none.
