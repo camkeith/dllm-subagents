@@ -154,9 +154,9 @@ def resolve_api_key(
     environ = os.environ if environ is None else environ
     keys_file = keys_file or (config_dir() / "keys.env")
     name = profile.api_key_env
-    value = environ.get(name)
+    value = (environ.get(name) or "").strip()
     if not value:
-        value = _parse_env_file(keys_file).get(name)
+        value = _parse_env_file(keys_file).get(name, "").strip()
     if not value:
         raise ConfigError(
             "No API key for provider %r. Set %s in the environment or add the line "

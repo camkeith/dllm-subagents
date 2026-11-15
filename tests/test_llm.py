@@ -154,13 +154,41 @@ class ChatClientTests(unittest.TestCase):
         self.assertEqual(len(fake.requests), 1)
         self.assertEqual(sleeps, [])
 
-    def test_api_key_not_in_errors(self):
-        for fake in (Fake(err(400, "bad")), Fake(*[err(500)] * 5), Fake(*[OSError("x")] * 5)):
+    def assert_clean(self, exc):
+        for text in (str(exc), repr(exc)):
+            self.assertNotIn(KEY, text)
+            self.assertNotIn(repr(KEY)[1:-1], text)
+
+    def test_valueerror_with_key_is_not_retried_or_leaked(self):
+        for text in ("Invalid header value Bearer " + KEY, "Invalid header value %r" % ("Bearer " + KEY + "\n",)):
+            fake = Fake(ValueError(text), ok({"role": "assistant", "content": "x"}))
+            client, sleeps = make(fake)
+            with self.assertRaises(LLMError) as cm:
+                client.complete(MSGS, TOOLS)
+            self.assert_clean(cm.exception)
+            self.assertEqual(len(fake.requests), 1)
+            self.assertEqual(sleeps, [])
+
+    def test_oserror_text_with_key_is_scrubbed(self):
+        for text in ("failed " + KEY, "failed %r" % (KEY + "\n",)):
+            client, _ = make(Fake(*[OSError(text)] * 5), max_retries=4)
+            with self.assertRaises(LLMError) as cm:
+                client.complete(MSGS, TOOLS)
+            self.assertIn("failed", str(cm.exception))
+            self.assert_clean(cm.exception)
+
+    def test_provider_body_echoing_key_is_scrubbed(self):
+        for fake in (Fake(err(400, "bad key " + KEY)), Fake(*[(500, {}, ("raw " + KEY).encode())] * 5)):
             client, _ = make(fake)
             with self.assertRaises(LLMError) as cm:
                 client.complete(MSGS, TOOLS)
-            self.assertNotIn(KEY, str(cm.exception))
-            self.assertNotIn(KEY, repr(cm.exception))
+            self.assertIn("***", str(cm.exception))
+            self.assert_clean(cm.exception)
+
+    def test_client_repr_has_no_key(self):
+        client, _ = make(Fake())
+        self.assertNotIn(KEY, repr(client))
+        self.assertNotIn(KEY, str(client))
 
 
 if __name__ == "__main__":

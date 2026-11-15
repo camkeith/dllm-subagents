@@ -76,6 +76,13 @@ class KeyTests(unittest.TestCase):
         self.keys.write_text("GROQ_API_KEY=file\n")
         self.assertEqual(resolve_api_key(self.profile, {"GROQ_API_KEY": "env"}, self.keys), "env")
 
+    def test_env_key_is_stripped(self):
+        self.assertEqual(resolve_api_key(self.profile, {"GROQ_API_KEY": "env\n"}, self.keys), "env")
+
+    def test_blank_env_key_falls_back_to_file(self):
+        self.keys.write_text("GROQ_API_KEY=file\n")
+        self.assertEqual(resolve_api_key(self.profile, {"GROQ_API_KEY": " \n"}, self.keys), "file")
+
     def test_key_from_keys_file(self):
         self.keys.write_text('# comment\n\nOTHER=zzz\nGROQ_API_KEY = "file"\n')
         self.assertEqual(resolve_api_key(self.profile, {}, self.keys), "file")

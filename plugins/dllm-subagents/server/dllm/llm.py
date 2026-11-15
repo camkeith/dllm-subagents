@@ -82,7 +82,12 @@ class ChatClient:
         return "ChatClient(profile=%r, model=%r)" % (self.profile.name, self.model)
 
     def _scrub(self, text: str) -> str:
-        return text.replace(self._api_key, "***") if self._api_key else text
+        if not self._api_key:
+            return text
+        for form in (self._api_key, repr(self._api_key)[1:-1], json.dumps(self._api_key)[1:-1]):
+            if form:
+                text = text.replace(form, "***")
+        return text
 
     def _body(self, messages: list, tools: list) -> bytes:
         p = self.profile
@@ -120,7 +125,10 @@ class ChatClient:
                 if deadline is not None:
                     timeout = max(1.0, min(timeout, deadline - self._clock()))
                 status, resp_headers, raw = self._transport(url, headers, body, timeout)
-            except (OSError, ValueError) as exc:  # URLError and timeouts are OSErrors
+            except ValueError:
+                # e.g. an invalid header value; never echo the text, it may hold the key
+                raise LLMError("Request could not be sent (invalid request data, check the API key format)")
+            except OSError as exc:  # URLError and timeouts are OSErrors
                 status, raw = None, b""
                 failure = "Network error contacting provider: %s" % self._scrub(str(exc))
             else:
