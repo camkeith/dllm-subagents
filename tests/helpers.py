@@ -4,8 +4,11 @@ import itertools
 import json
 import os
 import queue
+import subprocess
+import tempfile
 import threading
-from typing import Optional
+from pathlib import Path
+from typing import Dict, Optional
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SERVER_DIR = os.path.join(ROOT, "plugins", "dllm-subagents", "server")
@@ -88,3 +91,40 @@ def tool_completion(*calls, content=None, tokens=(100, 10)):
         finish_reason="tool_calls" if calls else "stop",
         message=message,
     )
+
+
+def isolated_git_env(tmp: str) -> Dict[str, str]:
+    """Environment overrides that keep git away from the user's global config and hooks."""
+    home = os.path.join(tmp, "home")
+    os.makedirs(home, exist_ok=True)
+    return {
+        "HOME": home,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.path.join(home, "gitconfig"),
+        "XDG_CONFIG_HOME": os.path.join(home, "xdg"),
+    }
+
+
+def make_repo(tmp, commit: bool = True) -> Path:
+    """Create a git repo under tmp with local-only identity config; optionally one initial commit.
+
+    Callers should apply isolated_git_env(tmp) to os.environ so git ignores global config.
+    """
+    repo = Path(tmp) / "repo"
+    repo.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env.update(isolated_git_env(str(tmp)))
+
+    def git(*args):
+        subprocess.run(["git", *args], cwd=str(repo), env=env, check=True, capture_output=True)
+
+    git("init", "-q")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.com")
+    git("config", "commit.gpgsign", "false")
+    if commit:
+        (repo / "a.txt").write_text("one\ntwo\nthree\n")
+        (repo / "b.txt").write_text("keep\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "initial")
+    return repo
