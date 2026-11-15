@@ -1,11 +1,14 @@
 """Git tree snapshots, diffs and undo that never touch the real index, HEAD, refs or stash."""
 from __future__ import annotations
 
+import codecs
 import os
 import re
+import select
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -36,13 +39,7 @@ class FileChange:
     removed: int
 
 
-def _git(
-    repo: Path,
-    args: List[str],
-    env: Optional[Dict[str, str]] = None,
-    input: Optional[bytes] = None,
-    ok_codes: Sequence[int] = (0,),
-) -> bytes:
+def _command(args: List[str], env: Optional[Dict[str, str]]) -> Tuple[List[str], Dict[str, str]]:
     cmd = ["git", "-c", "core.quotepath=false", "-c", "core.hooksPath=/dev/null"] + list(args)
     full_env = {
         k: v
@@ -52,6 +49,17 @@ def _git(
     full_env["GIT_OPTIONAL_LOCKS"] = "0"
     if env:
         full_env.update(env)
+    return cmd, full_env
+
+
+def _git(
+    repo: Path,
+    args: List[str],
+    env: Optional[Dict[str, str]] = None,
+    input: Optional[bytes] = None,
+    ok_codes: Sequence[int] = (0,),
+) -> bytes:
+    cmd, full_env = _command(args, env)
     try:
         proc = subprocess.run(
             cmd, cwd=str(repo), env=full_env, input=input, capture_output=True, timeout=_TIMEOUT
@@ -64,6 +72,54 @@ def _git(
         stderr = proc.stderr.decode("utf-8", "replace").strip()
         raise SnapshotError("git %s failed: %s" % (args[0], stderr))
     return proc.stdout
+
+
+def _git_head(repo: Path, args: List[str], max_chars: int) -> Tuple[str, bool]:
+    """The first max_chars characters of git's output, and whether it had more.
+
+    Reads incrementally and stops git once past the limit, so a huge patch is never read whole.
+    """
+    cmd, full_env = _command(args, None)
+    with tempfile.TemporaryFile() as err:  # a file, so a chatty stderr cannot block git
+        try:
+            proc = subprocess.Popen(cmd, cwd=str(repo), env=full_env, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=err)
+        except OSError as exc:
+            raise SnapshotError("could not run git: %s" % exc)
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        parts: List[str] = []
+        size, more = 0, False
+        deadline = time.monotonic() + _TIMEOUT
+        timed_out = SnapshotError("git %s timed out after %d s" % (args[0], _TIMEOUT))
+        try:
+            fd = proc.stdout.fileno()
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0 or not select.select([fd], [], [], left)[0]:
+                    raise timed_out
+                chunk = os.read(fd, 65536)
+                parts.append(decoder.decode(chunk, final=not chunk))
+                size += len(parts[-1])
+                if not chunk:
+                    break
+                if size > max_chars:
+                    more = True
+                    break
+            if not more:
+                try:
+                    proc.wait(max(0.0, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    raise timed_out
+        finally:
+            if proc.returncode is None:
+                proc.kill()
+                proc.wait()
+            proc.stdout.close()
+        if not more and proc.returncode != 0:
+            err.seek(0)
+            stderr = err.read().decode("utf-8", "replace").strip()
+            raise SnapshotError("git %s failed: %s" % (args[0], stderr))
+    return "".join(parts)[:max_chars], more
 
 
 def repo_root(workdir: Path) -> Path:
@@ -208,13 +264,13 @@ def diff_trees(
 
     changes = [FileChange(p, kinds[p], *counts.get(p, (0, 0))) for p in order]
 
-    text = _git(
+    text, truncated = _git_head(
         repo,
         _TREE_DIFF + ["-p", "--no-color", "--no-ext-diff", "--no-textconv", before, after],
-    ).decode("utf-8", "replace")
-    truncated = len(text) > max_chars
+        max_chars,
+    )
     if truncated:
-        text = text[:max_chars] + _TRUNC_NOTE
+        text += _TRUNC_NOTE
     return changes, text, truncated
 
 

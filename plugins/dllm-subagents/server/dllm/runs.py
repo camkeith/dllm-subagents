@@ -3,6 +3,7 @@ keeps one active run per repository (in-process and across processes), persists 
 undo works after a restart, and renders compact results for the orchestrating model."""
 from __future__ import annotations
 
+import collections
 import dataclasses
 import fcntl
 import json
@@ -26,6 +27,9 @@ CANCEL_WAIT_SECONDS = 5.0
 SHUTDOWN_GRACE_SECONDS = 5.0
 LOCK_NAME = "dllm-subagents.lock"
 PASSED_CHECK_TAIL_LINES = 5
+SUMMARY_MAX_CHARS = 4_000
+MAX_LISTED_FILES = 100
+MAX_GROUP_LINES = 20
 _POLL = 0.05
 _RUN_ID = re.compile(r"\d{8}-\d{6}-[0-9a-f]{6}")
 _UNDO_OWNER = "undo:"
@@ -520,6 +524,41 @@ class RunManager:
 _CHANGE_CODES = {"added": "A", "modified": "M", "deleted": "D"}
 
 
+def _top_level(path: str) -> str:
+    return path.split("/", 1)[0] + "/" if "/" in path else ""
+
+
+def _file_lines(changes: List[dict]) -> List[str]:
+    """One line per changed file, up to MAX_LISTED_FILES; the rest grouped by top-level directory."""
+    shown, rest = changes, []
+    if len(changes) > MAX_LISTED_FILES:
+        # List files from the smallest top-level groups first, so a few real edits stay visible
+        # next to thousands of generated files; keep them in diff order.
+        sizes = collections.Counter(_top_level(c["path"]) for c in changes)
+        ranked = sorted(range(len(changes)), key=lambda i: (sizes[_top_level(changes[i]["path"])], i))
+        keep = set(ranked[:MAX_LISTED_FILES])
+        shown = [c for i, c in enumerate(changes) if i in keep]
+        rest = [c for i, c in enumerate(changes) if i not in keep]
+    lines = []
+    for c in shown:
+        counts = "binary" if c["added"] < 0 else "+%d -%d" % (c["added"], c["removed"])
+        lines.append("%s %s (%s)" % (_CHANGE_CODES.get(c["change"], "?"), c["path"], counts))
+    groups: Dict[str, collections.Counter] = collections.OrderedDict()
+    for c in rest:
+        groups.setdefault(_top_level(c["path"]), collections.Counter())[c["change"]] += 1
+    order = sorted(groups, key=lambda d: -sum(groups[d].values()))
+    for d in order[:MAX_GROUP_LINES]:
+        kinds = groups[d]
+        detail = ", ".join("%d %s" % (kinds[k], k) for k in ("added", "modified", "deleted") if kinds[k])
+        lines.append("+ %d more %s (%s)" % (sum(kinds.values()), "under " + d if d else "at the top level",
+                                            detail))
+    others = order[MAX_GROUP_LINES:]
+    if others:
+        lines.append("+ %d more under %d other top-level paths"
+                     % (sum(sum(groups[d].values()) for d in others), len(others)))
+    return lines
+
+
 def render_view(view: dict) -> str:
     lines = ["status: %s" % view["status"], "run_id: %s" % view["run_id"]]
     if view["status"] == "running":
@@ -528,7 +567,8 @@ def render_view(view: dict) -> str:
                      "or fast_agent_cancel to stop it.")
         return "\n".join(lines)
 
-    lines.append("summary: %s" % (view.get("summary") or "(none, the subagent did not call finish)"))
+    summary = view.get("summary") or "(none, the subagent did not call finish)"
+    lines.append("summary: %s" % shell.truncate_middle(summary, SUMMARY_MAX_CHARS))
     if view.get("limit"):
         lines.append("limit: %s" % view["limit"])
     if view.get("error"):
@@ -554,9 +594,9 @@ def render_view(view: dict) -> str:
         lines.append("changed files: unknown, the run's changes could not be computed (see error)")
     elif changes:
         lines.append("changed files (%d):" % len(changes))
-        for c in changes:
-            counts = "binary" if c["added"] < 0 else "+%d -%d" % (c["added"], c["removed"])
-            lines.append("%s %s (%s)" % (_CHANGE_CODES.get(c["change"], "?"), c["path"], counts))
+        lines.extend(_file_lines(changes))
+        if len(changes) > MAX_LISTED_FILES:
+            lines.append("see all: git diff --stat %s %s" % (view["before_tree"], view["after_tree"]))
         lines.append("diff:")
         lines.append((view.get("diff") or "").rstrip("\n"))
         if view.get("diff_truncated"):

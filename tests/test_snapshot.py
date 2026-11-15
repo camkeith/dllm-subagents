@@ -114,6 +114,36 @@ class SnapshotTests(unittest.TestCase):
         self.assertFalse(trunc2)
         self.assertIn("+line of text", small)
 
+    def test_diff_read_is_bounded(self):
+        repo = make_repo(self.tmp)
+        before = snapshot_tree(repo)
+        (repo / "huge.txt").write_text("a fairly long line of generated text\n" * 200_000)  # ~7 MB patch
+        after = snapshot_tree(repo)
+        procs = []
+        real_popen = subprocess.Popen
+
+        def spy(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            procs.append((args[0], proc))
+            return proc
+
+        with mock.patch.object(subprocess, "Popen", spy):
+            changes, text, truncated = diff_trees(repo, before, after)
+        self.assertTrue(truncated)
+        self.assertLessEqual(len(text), 20_000 + 30)
+        self.assertTrue(text.endswith("[diff truncated]\n"))
+        self.assertEqual(changes[0].added, 200_000)  # counts stay complete
+        patch = [p for cmd, p in procs if "-p" in cmd]
+        self.assertEqual(len(patch), 1)
+        # git was stopped once the cap was reached, instead of writing the whole patch.
+        self.assertLess(patch[0].returncode, 0)
+
+    def test_diff_read_reports_git_failure(self):
+        repo = make_repo(self.tmp)
+        with self.assertRaises(SnapshotError) as cm:
+            diff_trees(repo, snapshot_tree(repo), "1" * 40)
+        self.assertIn("git diff-tree failed", str(cm.exception))
+
     def test_undo_restores_exactly(self):
         repo = make_repo(self.tmp)
         (repo / "u.txt").write_text("u\n")

@@ -235,6 +235,63 @@ class RunsTest(unittest.TestCase):
         self.assertNotIn("git diff " + "a" * 40, text)
         self.assertNotIn("\u2014", text)
 
+    def test_render_caps_many_files(self):
+        # A fresh repo with no .gitignore where the run creates thousands of dependency files.
+        repo = self.fresh_repo()
+        make = ("python3 -c \"import os; os.makedirs('node_modules/pkg'); "
+                "[open('node_modules/pkg/f%d.js' % i, 'w').write('x\\n') for i in range(2999)]\"")
+        m = self.manager([bash(make), write("src/app.js", "app\n"), finish("set up the app")])
+        rid = m.start("t", workdir=str(repo))
+        view = m.wait(rid, 60)
+        self.assertEqual(view["status"], "done")
+        self.assertEqual(len(view["changed_files"]), 3000)
+        text = render_view(view)
+        self.assertLess(len(text), 25_000)
+        self.assertIn("changed files (3000):", text)
+        self.assertIn("A src/app.js (+1 -0)", text)  # the real edit stays visible
+        self.assertIn("+ 2900 more under node_modules/ (2900 added)", text)
+        rec = self.record(rid)
+        hint = "see all: git diff --stat %s %s" % (rec.before_tree, rec.after_tree)
+        self.assertIn(hint, text)
+        self.assertIn("3000 files changed", git(repo, "diff", "--stat", rec.before_tree, rec.after_tree))
+        listed = [l for l in text.splitlines() if l.startswith("A ")]
+        self.assertEqual(len(listed), 100)
+        self.assertNotIn("—", text)
+
+    def test_render_groups_rest_by_top_level_dir(self):
+        changes = [{"path": "big/f%d" % i, "change": "added", "added": 1, "removed": 0} for i in range(150)]
+        changes += [{"path": "gen/g%d" % i, "change": "modified" if i % 2 else "deleted",
+                     "added": 1, "removed": 1} for i in range(30)]
+        changes += [{"path": "top%d.txt" % i, "change": "added", "added": 1, "removed": 0} for i in range(3)]
+        view = {
+            "status": "done", "run_id": "20261115-120000-abcdef", "summary": "ok", "limit": None,
+            "error": None, "check": None, "stats": {}, "changed_files": changes, "diff": "",
+            "diff_truncated": False, "log_path": "", "before_tree": "a" * 40, "after_tree": "b" * 40,
+        }
+        text = render_view(view)
+        # The smallest groups are listed in full; the rest is grouped.
+        for i in range(3):
+            self.assertIn("A top%d.txt" % i, text)
+        self.assertIn("D gen/g0 (+1 -1)", text)
+        self.assertIn("+ 83 more under big/ (83 added)", text)
+        self.assertNotIn("more under gen/", text)
+        self.assertIn("see all: git diff --stat %s %s" % ("a" * 40, "b" * 40), text)
+        many = [{"path": "d%d/f" % i, "change": "added", "added": 1, "removed": 0} for i in range(400)]
+        text = render_view(dict(view, changed_files=many))
+        self.assertLess(len(text), 6_000)
+        self.assertIn("+ 280 more under 280 other top-level paths", text)
+
+    def test_render_caps_summary(self):
+        view = {
+            "status": "done", "run_id": "20261115-120000-abcdef", "summary": "s" * 50_000,
+            "limit": None, "error": None, "check": None, "stats": {}, "changed_files": [],
+            "diff": "", "diff_truncated": False, "log_path": "", "before_tree": "a" * 40,
+            "after_tree": "a" * 40,
+        }
+        text = render_view(view)
+        self.assertLess(len(text), 4_600)
+        self.assertIn("summary: " + "s" * 2_000 + "\n... [46000 characters cut] ...\n", text)
+
     def test_workdir_fallback(self):
         os.environ["CLAUDE_PROJECT_DIR"] = str(self.repo)
         m = self.manager([write("from_env.txt"), finish()])
