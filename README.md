@@ -87,34 +87,38 @@ Example `~/.config/dllm-subagents/config.json`:
 
 Any OpenAI-compatible chat completions endpoint works (a local vLLM or Ollama, for example). Use it with `provider: "local"` or by setting it as `default_provider`.
 
+Give a `base_url` you add an `https://` address unless it is on your own machine. The key travels in the `Authorization` header, and urllib follows redirects and sends that header again to the new address.
+
 The Cerebras free trial (5 requests per minute on gpt-oss-120b) is too slow for an agent loop; use pay-as-you-go.
 
 ## Limits
 
 Defaults: 40 steps, 300 seconds, 2,000,000 tokens per run. Change them under `limits` in `config.json`, or per call with `max_steps` (1 to 150) and `max_seconds` (10 to 1800).
 
-Each `fast_agent` and `fast_agent_wait` call returns within 50 seconds, with `status: running` if the run is still going; the orchestrator then calls `fast_agent_wait` again. The cap exists because Codex's default tool timeout is 60 seconds.
+Each `fast_agent` and `fast_agent_wait` call returns within 50 seconds by default, with `status: running` if the run is still going; the orchestrator then calls `fast_agent_wait` again. Set `wait_seconds` in `config.json` to change it, up to 55. The cap exists because Codex's default tool timeout is 60 seconds.
 
 ## Safety and guardrails
 
-The subagent's `bash` runs as you, in your repo, outside the permission prompts of Claude Code or Codex. Guardrails block common accidents:
+The subagent's `bash` runs as you, in your repo, outside the permission prompts of Claude Code or Codex. Guardrails block common accidents. A `bash` command is refused when it has:
 
-- git commands that are not read-only (including `git add`, `git branch`, `git stash`)
-- `sudo`
-- recursive `rm` outside the repo, including after `cd`
-- `curl | sh`
-- disk tools
-- reading the plugin's key file
+- a git command that is not read-only (only `status`, `diff`, `log`, `show`, `ls-files`, `grep`, `blame`, and `rev-parse` are allowed, so `git add`, `git commit`, `git stash` and the rest are blocked)
+- `sudo` or `doas`
+- a recursive `rm` of a path outside the repo or of the repo itself, after a `cd` the guard cannot follow, or on a target that uses a variable or command substitution (such as `rm -rf $DIR/*`)
+- `curl` or `wget` piped into a shell, or a shell reading a download (`bash <(curl ...)`)
+- `mkfs`, or `dd` writing to a device under `/dev`
+- `shutdown`, `reboot`, `poweroff`, or `halt`
+- `keys.env`, or the full path of the plugin's config directory, anywhere in it (a `~/...` spelling of that path is not caught)
 
-These are **not a security boundary.** The subagent has network access and can read files outside the repo through bash, and a deliberately encoded read (base64, for example) can get around key redaction. Do not point it at untrusted repos. The file tools (`read`, `write`, `edit`) are confined to the repo.
+These are **not a security boundary.** The subagent has network access and can read files outside the repo through bash, and a deliberately encoded read (base64, for example) can get around key redaction. Do not point it at untrusted repos. The file tools (`read`, `write`, `edit`) are confined to the repo, and `write` and `edit` refuse paths inside a `.git` directory.
 
 ## Snapshots and undo
 
 - The repo must be a git repo (`git init` if it is not).
 - Snapshots never touch your index, HEAD, refs, or stash.
-- Files ignored by git before the run are never shown or deleted.
+- Files ignored by git before the run are never deleted by undo, and changes the run makes to them are not tracked.
+- Make sure dependency and build directories (`node_modules`, `.venv`, `dist`, `build`) are git-ignored, especially in a fresh `git init` repo. A run that creates huge numbers of files git does not ignore makes snapshots slow, and the result then lists only 100 files plus a `git diff --stat` command for the rest.
 - One active run per repo or worktree, enforced across sessions.
-- Run records and logs live in the plugin data directory, or `~/.cache/dllm-subagents/runs` when there is none.
+- Run records and logs live in `$DLLM_SUBAGENTS_RUNS_DIR` when it is set, else in the plugin data directory, or `~/.cache/dllm-subagents/runs` when there is none.
 
 ## Speed and live results
 

@@ -30,6 +30,7 @@ description: Use when a build or edit job is well scoped and would mean writing 
 Put in `task`: the goal, constraints, existing patterns to follow (name the files), and what done means. The subagent has no memory of this conversation, so say everything it needs.
 
 - Always pass `workdir`: the absolute path of the git repo (or worktree). It must be a git repo.
+- Before delegating, make sure dependency and build directories (`node_modules`, `.venv`, `dist`, `build`) are git-ignored, especially in a fresh `git init` repo. Otherwise every file the run installs or builds is snapshotted and listed as a change.
 - Pass `files` for paths you already know are relevant; their contents are given to the subagent up front.
 - Pass `check_command` whenever one exists (for example `pytest tests/test_api.py`). The harness runs it after the subagent finishes and lets the subagent fix failures a few times.
 - Optional: `provider` and `model` override the configured defaults; `max_steps` (1 to 150) and `max_seconds` (10 to 1800) override limits.
@@ -38,7 +39,9 @@ Put in `task`: the goal, constraints, existing patterns to follow (name the file
 
 1. Call `fast_agent`. It waits up to about 50 seconds, then returns.
 2. While the result says `status: running`, call `fast_agent_wait` with the `run_id` until it finishes.
-3. To stop a run, call `fast_agent_cancel` with the `run_id`.
+3. To stop a run, call `fast_agent_cancel` with the `run_id`. It can return `status: running` while a model call is in flight; call `fast_agent_wait` to see the run end.
+
+Setup errors (no API key, a bad or missing `workdir`, not a git repo, another run already active in the repo, an unknown provider) come back as a plain tool error message, not as a `status: error` result. No run was started; fix the cause and call `fast_agent` again.
 
 ## Reading the result
 
@@ -48,9 +51,11 @@ Put in `task`: the goal, constraints, existing patterns to follow (name the file
 - `check_failed`: it finished but `check_command` still fails; read the check output.
 - `limit_reached`: it hit a step, time, or token limit; the work may be partial.
 - `cancelled`: the run was stopped.
-- `error`: something failed (see the `error` line, for example a missing API key).
+- `error`: the run failed after it started (see the `error` line, for example the provider returned an error).
 
-The result also has the subagent's `summary`, a `check:` line (command, exit code, attempts), stats, the changed files, and the full git `diff` computed by the harness, not by the subagent. Trust the diff over the summary.
+The result also has the subagent's `summary`, a `check:` line (command, exit code, attempts), stats, the changed files, and the git `diff` computed by the harness, not by the subagent. Trust the diff over the summary.
+
+Long results are cut. A cut diff ends with a `git diff <before> <after>` command that shows the rest; a long file list ends with a `git diff --stat <before> <after>` command that lists every changed file. Run them in the repo.
 
 ## After the run
 
