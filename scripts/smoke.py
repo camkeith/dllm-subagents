@@ -36,7 +36,8 @@ def list_models(profile, key):
         profile.base_url.rstrip("/") + "/models", headers={"Authorization": "Bearer " + key})
     with urllib.request.urlopen(request, timeout=30) as response:
         data = json.loads(response.read().decode("utf-8"))
-    return sorted(str(m.get("id")) for m in data.get("data", []) if isinstance(m, dict))
+    items = data.get("data") if isinstance(data, dict) else None
+    return sorted(str(m.get("id")) for m in (items or []) if isinstance(m, dict))
 
 
 def family(model):
@@ -60,17 +61,17 @@ def show_models(profile, key):
     return present
 
 
-def run_provider(profile, key, secret_names, keep):
+def run_provider(profile, key, secret_names, limits, keep):
     workdir = Path(tempfile.mkdtemp(prefix="dllm-smoke-%s-" % profile.name))
-    subprocess.run(["git", "init", "-q"], cwd=str(workdir), check=True)
-    ctx = ToolContext(workdir, threading.Event(), env=scrubbed_env(secret_names))
     traj = workdir / "trajectory.json"
-    settings = load_settings()
-    agent = Agent(ChatClient(profile, key), ctx, settings.limits, check_command=CHECK,
-                  trajectory_path=traj)
-    result = agent.run(build_task_message(TASK, str(workdir), CHECK, [], []))
-    if not keep:
-        shutil.rmtree(str(workdir), ignore_errors=True)
+    try:
+        subprocess.run(["git", "init", "-q"], cwd=str(workdir), check=True)
+        ctx = ToolContext(workdir, threading.Event(), env=scrubbed_env(secret_names))
+        agent = Agent(ChatClient(profile, key), ctx, limits, check_command=CHECK, trajectory_path=traj)
+        result = agent.run(build_task_message(TASK, str(workdir), CHECK, [], []))
+    finally:
+        if not keep:
+            shutil.rmtree(str(workdir), ignore_errors=True)
     return result, workdir, traj
 
 
@@ -81,7 +82,11 @@ def main(argv=None):
     parser.add_argument("--keep", action="store_true")
     args = parser.parse_args(argv)
 
-    settings = load_settings()
+    try:
+        settings = load_settings()
+    except ConfigError as exc:
+        print("Config error: %s" % exc)
+        return 1
     names = args.provider or list(settings.profiles)
     unknown = [n for n in names if n not in settings.profiles]
     if unknown:
@@ -109,7 +114,12 @@ def main(argv=None):
     header = ("provider", "model", "status", "steps", "seconds", "in_tok", "out_tok", "check")
     rows, failures, kept = [], [], []
     for profile, key in keyed:
-        result, workdir, traj = run_provider(profile, key, secret_names, args.keep)
+        try:
+            result, workdir, traj = run_provider(profile, key, secret_names, settings.limits, args.keep)
+        except Exception as exc:
+            rows.append((profile.name, profile.model, "crashed", "-", "-", "-", "-", "-"))
+            failures.append((profile.name, "%s: %s" % (type(exc).__name__, exc)))
+            continue
         check = str(result.check.exit_code) if result.check else "-"
         rows.append((profile.name, profile.model, result.status, str(result.steps),
                      "%.1f" % result.seconds, str(result.input_tokens), str(result.output_tokens), check))

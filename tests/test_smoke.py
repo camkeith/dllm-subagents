@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import contextlib
+import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -7,12 +10,23 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from helpers import ROOT
+from helpers import ROOT, SERVER_DIR
 
 SMOKE = os.path.join(ROOT, "scripts", "smoke.py")
-REAL_KEY_VARS = ("INCEPTION_API_KEY", "CEREBRAS_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY")
+DEFAULTS = os.path.join(SERVER_DIR, "providers.default.json")
+ENV_ALLOWLIST = ("PATH", "HOME", "TMPDIR", "LANG")
+
+
+def _minimal_env():
+    return {k: os.environ[k] for k in ENV_ALLOWLIST if k in os.environ}
+
+
+def _shipped_key_vars():
+    with open(DEFAULTS) as f:
+        return [p["api_key_env"] for p in json.load(f)["providers"].values()]
 FAKE_KEY = "sk-fake-secret-123"
 
 CALC = "def add(a, b):\n    return a + b\n\n\ndef mul(a, b):\n    return a * b\n"
@@ -90,7 +104,9 @@ class SmokeTest(unittest.TestCase):
             f.write(text)
 
     def _run(self, *args):
-        env = {k: v for k, v in os.environ.items() if k not in REAL_KEY_VARS + ("FAKE_API_KEY",)}
+        env = _minimal_env()
+        for name in _shipped_key_vars():
+            self.assertNotIn(name, env)
         env["DLLM_SUBAGENTS_CONFIG_DIR"] = self.cfg
         return subprocess.run([sys.executable, SMOKE] + list(args), env=env,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -142,6 +158,72 @@ class SmokeTest(unittest.TestCase):
         r = self._run("--provider", "fake")
         self.assertEqual(r.returncode, 1, r.stdout)
         self.assertIn("error", r.stdout)
+
+    def _load_module(self):
+        spec = importlib.util.spec_from_file_location("smoke_under_test", SMOKE)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _two_providers(self):
+        with open(os.path.join(self.cfg, "config.json")) as f:
+            cfg = json.load(f)
+        cfg["providers"]["fake2"] = dict(cfg["providers"]["fake"], api_key_env="FAKE2_API_KEY")
+        with open(os.path.join(self.cfg, "config.json"), "w") as f:
+            json.dump(cfg, f)
+        self._keys("FAKE_API_KEY=%s\nFAKE2_API_KEY=%s\n" % (FAKE_KEY, FAKE_KEY))
+
+    def _main_in_process(self, module, *args):
+        env = _minimal_env()
+        env["DLLM_SUBAGENTS_CONFIG_DIR"] = self.cfg
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=True), contextlib.redirect_stdout(out):
+            code = module.main(list(args))
+        return code, out.getvalue()
+
+    def test_crashing_provider_is_isolated_and_cleaned_up(self):
+        self._two_providers()
+        module = self._load_module()
+        made = []
+        real_mkdtemp, real_run = tempfile.mkdtemp, subprocess.run
+
+        def mkdtemp(*a, **k):
+            made.append(real_mkdtemp(*a, **k))
+            return made[-1]
+
+        def run(cmd, **k):
+            if "fake2" in str(k.get("cwd")):
+                raise subprocess.CalledProcessError(1, cmd)
+            return real_run(cmd, **k)
+
+        with mock.patch.object(module.tempfile, "mkdtemp", mkdtemp), \
+                mock.patch.object(module.subprocess, "run", run):
+            code, out = self._main_in_process(module, "--provider", "fake2", "--provider", "fake")
+        self.assertEqual(code, 1, out)
+        self.assertRegex(out, r"fake2\s+fake-model\s+crashed")
+        self.assertRegex(out, r"fake\s+fake-model\s+done")
+        self.assertIn("fake2 failed: CalledProcessError", out)
+        self.assertEqual(len(made), 2)
+        for path in made:
+            self.assertFalse(os.path.exists(path), path)
+
+    def test_bad_config_exits_1_without_traceback(self):
+        with open(os.path.join(self.cfg, "config.json"), "w") as f:
+            f.write("{not json")
+        r = self._run()
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("Config error", r.stdout)
+        self.assertNotIn("Traceback", r.stdout)
+
+    def test_list_models_tolerates_odd_shapes(self):
+        module = self._load_module()
+        profile = type("P", (), {"base_url": "http://x/v1"})()
+        for payload in (b'[]', b'{"data": null}', b'{"data": [1, {"id": "a"}]}'):
+            resp = mock.MagicMock()
+            resp.__enter__.return_value.read.return_value = payload
+            with mock.patch.object(module.urllib.request, "urlopen", return_value=resp):
+                ids = module.list_models(profile, "k")
+            self.assertEqual(ids, ["a"] if b"id" in payload else [])
 
 
 if __name__ == "__main__":
