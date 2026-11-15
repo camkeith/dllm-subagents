@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "fast-agent": {
+      "command": "python3",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/server/fast_agent_server.py"]
+    }
+  }
+}
