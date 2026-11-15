@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "fast-agent": {
+      "command": "python3",
+      "args": ["./server/fast_agent_server.py"],
+      "cwd": ".",
+      "env_vars": ["INCEPTION_API_KEY", "CEREBRAS_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY"]
+    }
+  }
+}

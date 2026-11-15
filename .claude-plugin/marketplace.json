@@ -1,0 +1,11 @@
+{
+  "name": "dllm-subagents",
+  "owner": {"name": "camkeith"},
+  "plugins": [
+    {
+      "name": "dllm-subagents",
+      "source": "./plugins/dllm-subagents",
+      "description": "Hand build and edit jobs to a fast-model subagent"
+    }
+  ]
+}
