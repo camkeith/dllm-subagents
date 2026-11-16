@@ -129,7 +129,34 @@ These are **not a security boundary.** The subagent has network access and can r
 
 ## Speed and live results
 
-Results will be recorded here after the live smoke test (`python3 scripts/smoke.py`) and the speed check.
+### Live eval suite
+
+`scripts/evals.py` runs realistic delegation jobs against a provider. Each job is a small starter repo, a brief like the orchestrator would write, the check command the model is given, and a hidden check it never sees (so a model cannot pass by writing weak tests). Offline tests (`tests/test_evals.py`) prove every hidden check fails on the starter repo and passes on a reference solution.
+
+```
+python3 scripts/evals.py --provider mercury --repeat 2      # all jobs, 2 runs each
+python3 scripts/evals.py --case write_tests --keep          # one job, keep the repo and trajectory
+python3 scripts/evals.py --out results.json                 # also write every run as JSON
+```
+
+| Job | What it asks for | Hidden check |
+| --- | --- | --- |
+| `spec_module` | Build `slugify` from a written spec, with tests | Spec tests, edge cases included |
+| `follow_pattern` | Add an orders handler following the users handler | Behaviour per the brief, routes registered |
+| `rename_across_files` | Rename a function and keyword across a small package (10 files change), keep a deprecated alias | No old names left, alias warns and forwards |
+| `write_tests` | Write tests for existing money parsing code | Tests pass on the original and fail on 3 planted bugs |
+| `fix_failing_test` | Make a failing test pass without editing tests | Tests untouched, extra tests pass |
+| `large_file_edit` | Change one function in a 600-line file | New behaviour, every other function unchanged |
+| `add_types_docs` | Add type hints and docstrings | Every public function annotated, behaviour unchanged |
+| `debug_symptom` | Find a bug from a symptom report only | A test reproducing the symptom |
+
+### Results
+
+Mercury (`mercury-3`), 2026-11-16, 2 runs per job: 16 of 16 runs passed the hidden checks. For jobs whose brief asks for tests, the hidden check also requires the model's new tests to fail against the original or a stub implementation, so a run that skips the tests or writes weak ones does not pass. Runs took 4 to 11 steps and 2 to 12 seconds; the rename took 9 and 11 steps. In `debug_symptom` both runs fixed the root cause (a shared cache mutated on every call) and added a regression test, but that is one small case; the skill still advises against delegating subtle debugging.
+
+Prompt change, measured in one 16-run comparison per prompt (per-job variance is high): telling the model that bash already starts in the working directory and to batch independent calls in one response took the suite from 125 to 104 steps, from 543k to 423k input tokens and from 127 s to 99 s, with the same pass rate. A later 16-run pass with the stricter checks took 99 steps, 419k input tokens and 102 s.
+
+Cerebras, Groq and OpenRouter are not measured yet. The speed check (delegated job against the orchestrator alone) is still to do.
 
 ## Troubleshooting
 
