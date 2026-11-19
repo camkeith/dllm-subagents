@@ -136,7 +136,7 @@ These are **not a security boundary.** The subagent has network access and can r
 ```
 python3 scripts/evals.py --provider mercury --repeat 2      # all jobs, 2 runs each
 python3 scripts/evals.py --case write_tests --keep          # one job, keep the repo and trajectory
-python3 scripts/evals.py --out results.json                 # also write every run as JSON
+python3 scripts/evals.py --out results.json                 # also write every run as JSON (after each run)
 ```
 
 | Job | What it asks for | Hidden check |

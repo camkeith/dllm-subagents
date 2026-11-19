@@ -1,6 +1,8 @@
 """Offline tests for the live eval suite (scripts/eval_cases.py and scripts/evals.py). No network."""
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -8,9 +10,11 @@ import subprocess
 import sys
 import tempfile
 import threading
+import types
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from unittest import mock
 
 from helpers import ROOT, isolated_git_env
 from test_smoke import FAKE_KEY, _minimal_env, _shipped_key_vars
@@ -20,6 +24,9 @@ if SCRIPTS not in sys.path:
     sys.path.insert(0, SCRIPTS)
 
 import eval_cases  # noqa: E402
+import evals  # noqa: E402
+from dllm.agent import AgentResult  # noqa: E402
+from dllm.config import Limits  # noqa: E402
 
 EVALS = os.path.join(SCRIPTS, "evals.py")
 
@@ -294,6 +301,72 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(r.returncode, 1, r.stdout)
         self.assertIn("skip fake: no key (set FAKE_API_KEY)", r.stdout)
         self.assertIn("No provider has an API key", r.stdout)
+
+
+PROFILE = types.SimpleNamespace(name="fake", model="fake-model")
+
+
+def _row(case="spec_module", repeat=1, status="done", hidden_passed=False, error=None):
+    passed = status == "done" and bool(hidden_passed)
+    return dict(provider="fake", model="fake-model", case=case, category=case, repeat=repeat,
+                status=status, steps=1, seconds=0.1, input_tokens=1, output_tokens=1, check_exit=0,
+                hidden_passed=hidden_passed, changed_files=0, passed=passed, error=error,
+                summary="s", hidden_output="")
+
+
+class RunnerUnitTests(unittest.TestCase):
+    """In-process runner tests with the agent and the hidden check mocked out."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.out = os.path.join(self.tmp.name, "rows.json")
+        loaded = (types.SimpleNamespace(limits=Limits(), pass_env=()), [(PROFILE, FAKE_KEY)], [], [FAKE_KEY])
+        patcher = mock.patch.object(evals.smoke, "load_providers", return_value=loaded)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def main(self, *argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            code = evals.main(list(argv))
+        return code, buf.getvalue()
+
+    def test_repeat_runs_each_case_n_times(self):
+        with mock.patch.object(evals, "run_case", side_effect=lambda *a: (_row(repeat=a[-1]), None, None)) as rc:
+            code, _ = self.main("--case", "spec_module", "--repeat", "3", "--out", self.out)
+        self.assertEqual(code, 0)
+        self.assertEqual([c.args[-1] for c in rc.call_args_list], [1, 2, 3])
+        with open(self.out) as f:
+            self.assertEqual([r["repeat"] for r in json.load(f)], [1, 2, 3])
+
+    def test_out_keeps_finished_rows_when_the_run_is_interrupted(self):
+        results = [(_row(), None, None), KeyboardInterrupt()]
+        with mock.patch.object(evals, "run_case", side_effect=results):
+            with self.assertRaises(KeyboardInterrupt):
+                self.main("--case", "spec_module", "--repeat", "2", "--out", self.out)
+        with open(self.out) as f:
+            self.assertEqual(len(json.load(f)), 1)
+
+    def test_hidden_check_crash_is_recorded_and_printed(self):
+        result = AgentResult(status="done", summary="s", limit=None, error=None, check=None, steps=1,
+                             seconds=0.1, input_tokens=1, output_tokens=1)
+        case = eval_cases.CASES_BY_NAME["spec_module"]
+        with mock.patch.object(evals.smoke, "run_agent", return_value=result), \
+                mock.patch.object(evals, "run_hidden", side_effect=OSError("boom")):
+            row, _, _ = evals.run_case(PROFILE, FAKE_KEY, case, evals.smoke.load_providers()[0], [],
+                                       [FAKE_KEY], False, 1)
+        self.assertEqual((row["status"], row["hidden_passed"], row["passed"]), ("done", None, False))
+        self.assertEqual(row["error"], "OSError: boom")
+        with mock.patch.object(evals, "run_case", return_value=(row, None, None)):
+            _, out = self.main("--case", "spec_module")
+        self.assertIn("fake spec_module #1 done: OSError: boom", out)
+
+    def test_output_tail_does_not_cut_a_key_in_half(self):
+        text = "a" * 100 + FAKE_KEY + "b" * (evals.OUTPUT_TAIL_CHARS - 10)
+        self.assertIn(FAKE_KEY[-10:], text[-evals.OUTPUT_TAIL_CHARS:])  # a raw cut would leak this piece
+        self.assertNotIn(FAKE_KEY[-10:], evals.output_tail(text, [FAKE_KEY]))
+        self.assertEqual(evals.output_tail("x " + FAKE_KEY, [FAKE_KEY]), "x ***")
 
 
 if __name__ == "__main__":

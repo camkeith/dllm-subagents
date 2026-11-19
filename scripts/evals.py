@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -56,6 +57,19 @@ def run_hidden(case, repo, env):
     return res.returncode == 0 and not res.timed_out, output
 
 
+def output_tail(text, known_keys):
+    """The last OUTPUT_TAIL_CHARS of text, redacted before the cut so the cut cannot split a key."""
+    return redact(text, known_keys)[-OUTPUT_TAIL_CHARS:]
+
+
+def write_rows(path, rows, known_keys):
+    """Write every row so far as JSON (redacted), replacing the file atomically."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(redact(json.dumps(rows, indent=2), known_keys) + "\n", encoding="utf-8")
+    os.replace(str(tmp), str(path))
+
+
 def run_case(profile, key, case, settings, secret_names, known_keys, keep, repeat):
     base = Path(tempfile.mkdtemp(prefix="dllm-eval-%s-%s-" % (profile.name, case.name)))
     repo, traj = base / "repo", base / "trajectory.json"  # trajectory outside the repo: not a changed file
@@ -79,7 +93,7 @@ def run_case(profile, key, case, settings, secret_names, known_keys, keep, repea
         row["changed_files"] = changed_files(repo)
         passed, output = run_hidden(case, repo, run_env(secret_names, settings.pass_env))
         row["hidden_passed"] = passed
-        row["hidden_output"] = output[-OUTPUT_TAIL_CHARS:]
+        row["hidden_output"] = output_tail(output, known_keys)
         row["passed"] = result.status == "done" and passed
     except Exception as exc:
         row["error"] = "%s: %s" % (type(exc).__name__, exc)
@@ -153,6 +167,8 @@ def main(argv=None):
                 row, repo, traj = run_case(profile, key, case, settings, secret_names, known_keys,
                                            args.keep, repeat)
                 rows.append(row)
+                if args.out:  # after every run, so a crash or Ctrl-C keeps the finished rows
+                    write_rows(args.out, rows, known_keys)
                 if args.keep:
                     kept.append(("%s %s #%d" % (profile.name, case.name, repeat), repo, traj))
 
@@ -167,7 +183,7 @@ def main(argv=None):
     print("Per category:")
     print_table(("provider", "category", "runs", "done", "hidden", "pass", "rate"),
                 summary_rows(rows, "category"))
-    problems = [r for r in rows if r["status"] != "done" and r["error"]]
+    problems = [r for r in rows if r["error"] and not r["passed"]]
     if problems:
         print()
     for r in problems:
@@ -176,7 +192,6 @@ def main(argv=None):
         print("kept %s: %s" % (label, repo))
         print("trajectory %s: %s" % (label, traj))
     if args.out:
-        Path(args.out).write_text(redact(json.dumps(rows, indent=2), known_keys) + "\n", encoding="utf-8")
         print("wrote %s" % args.out)
     return 0
 

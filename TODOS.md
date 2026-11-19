@@ -5,6 +5,7 @@
 - [x] Live smoke test and eval suite on Mercury (2026-11-16): `mercury-3` is listed, smoke passes, and `scripts/evals.py` passes 16 of 16 runs (see the README).
 - [ ] Live smoke test and `python3 scripts/evals.py --repeat 2` on Cerebras, Groq and OpenRouter once their keys exist; verify their shipped model IDs with `python3 scripts/smoke.py --models`.
 - [ ] Harder eval jobs: every current job passes on Mercury, so the suite cannot yet show where fast models stop being reliable. Add jobs that need more steps or judgment (a multi-module feature, a refactor with a behaviour-preserving check, a non-Python stack).
+- [ ] Tighter eval scoring: the `rename_across_files` hidden check does not test that `get_user` still returns a copy, `build_email` for an active user, or the full `profile_card` dict; `write_tests` accepts any nonzero exit on the original code (a timeout counts). Provider failures (status `error`, such as a rate limit) count as model failures in the pass rate; report them separately.
 - [ ] Real end-to-end runs in Claude Code and in Codex (the Codex API key must be renewed first).
 - [ ] Speed check: time a delegated job against the orchestrator doing the same job alone, and record the numbers in the README under "Speed and live results".
 - [ ] HTTP keep-alive: decide whether to reuse connections based on the speed check numbers.

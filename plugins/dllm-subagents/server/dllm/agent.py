@@ -27,7 +27,7 @@ TOOL_RESULT_MAX_CHARS = 30_000
 CHECK_TAIL_CHARS = 4_000
 
 FORMAT_ERROR_MESSAGE = (
-    "Your last reply did not call a tool. Call exactly one of the available tools. "
+    "Your last reply did not call a tool. Call one or more of the available tools. "
     "If you are done, call finish with a short summary of what you changed."
 )
 
@@ -207,6 +207,7 @@ class Agent:
         bad_format = False
         pending_stop: Optional[_Stop] = None
         finished = False
+        failed = False  # an earlier call in this response returned an error
         for i, call in enumerate(calls):
             if finished:
                 self._tool_message(call.id, "This call was not run: finish was already called in this response.")
@@ -224,16 +225,23 @@ class Agent:
                 if not isinstance(args, dict):
                     raise ValueError("expected a JSON object")
             except ValueError as exc:
-                bad_format = True
+                bad_format = failed = True
                 self._progress("%s: invalid arguments" % call.name)
                 self._tool_message(call.id, "Error: invalid JSON arguments: %s" % exc)
                 continue
             self._progress(self._scrub(_label(call.name, args, self._scrub)))
-            if call.name == "finish":
+            if call.name == "finish" and failed:
+                # Finishing on top of a failed edit would report work that did not happen.
+                finished = True
+                self._tool_message(call.id, "This finish was not run: an earlier call in this response "
+                                   "failed. Read its error, fix it, then call finish again.")
+            elif call.name == "finish":
                 finished = True
                 pending_stop = self._handle_finish(call.id, args)
             else:
-                self._tool_message(call.id, self._run_tool(call.name, args))
+                output = self._run_tool(call.name, args)
+                failed = failed or output.startswith("Error:")
+                self._tool_message(call.id, output)
         if pending_stop is not None:
             raise pending_stop
         if bad_format:
