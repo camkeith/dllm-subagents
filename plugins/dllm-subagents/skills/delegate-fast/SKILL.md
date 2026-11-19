@@ -18,7 +18,7 @@ description: Use when a build or edit job is well scoped and would mean writing 
 - Fixing lint or type errors.
 - Any job where you would otherwise type a lot of code.
 
-Measured: the repo's eval suite (`scripts/evals.py`) has small jobs for a module from a spec, a handler following a pattern, a rename across files, tests for existing code, a failing test, an edit in a large file, and adding type hints. Mercury passed their hidden checks when briefed with a check command. Lint and type-checker fixes are not covered yet.
+Measured: the repo's eval suite (`scripts/evals.py`) has small jobs for a module from a spec, a handler following a pattern, a rename across files, tests for existing code, a failing test, an edit in a large file, and adding type hints. Mercury passed their hidden checks (2 runs per job, 2026-11-16) when briefed with a check command. Lint and type-checker fixes are not covered yet.
 
 ## When not to delegate
 

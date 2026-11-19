@@ -25,28 +25,31 @@ from dllm.config import clamp_limits
 from dllm.shell import run_command
 from dllm.tools import redact, run_env
 
-HIDDEN_TIMEOUT = 120
+HIDDEN_TIMEOUT = 300  # write_tests alone runs the model's tests up to 4 times, 60 s each
 OUTPUT_TAIL_CHARS = 2000
+# Hooks and fsmonitor off: after a run, .git/config is model-controlled (as in dllm.snapshot).
 GIT_CONFIG = ["-c", "user.name=dllm-evals", "-c", "user.email=evals@example.invalid",
-              "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"]
+              "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]
 HEADER = ("provider", "model", "case", "category", "status", "steps", "seconds", "in_tok", "out_tok",
           "check", "hidden", "changed")
 
 
-def git(repo, *args):
-    return subprocess.run(["git"] + GIT_CONFIG + list(args), cwd=str(repo), check=True,
+def git(repo, *args, env):
+    """Run git in repo with env (the run's scrubbed environment) minus GIT_* overrides."""
+    env = {k: v for k, v in env.items() if not k.startswith("GIT_")}
+    return subprocess.run(["git"] + GIT_CONFIG + list(args), cwd=str(repo), check=True, env=env,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True).stdout
 
 
-def prepare_repo(case, repo):
+def prepare_repo(case, repo, env):
     eval_cases.write_files(repo, eval_cases.starting_files(case))
-    git(repo, "init", "-q")
-    git(repo, "add", "-A")
-    git(repo, "commit", "-q", "--no-verify", "-m", "starting files")
+    git(repo, "init", "-q", env=env)
+    git(repo, "add", "-A", env=env)
+    git(repo, "commit", "-q", "--no-verify", "-m", "starting files", env=env)
 
 
-def changed_files(repo):
-    out = git(repo, "status", "--porcelain", "--untracked-files=all")
+def changed_files(repo, env):
+    out = git(repo, "status", "--porcelain", "--untracked-files=all", env=env)
     return len([line for line in out.splitlines() if line.strip()])
 
 
@@ -62,11 +65,23 @@ def output_tail(text, known_keys):
     return redact(text, known_keys)[-OUTPUT_TAIL_CHARS:]
 
 
+def check_out_path(path):
+    """Fail on a --out path that cannot be written, without touching an existing file there."""
+    path = Path(path)
+    if path.is_dir():
+        raise IsADirectoryError(21, "is a directory")
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("", encoding="utf-8")
+    tmp.unlink()
+
+
 def write_rows(path, rows, known_keys):
-    """Write every row so far as JSON (redacted), replacing the file atomically."""
+    """Write every row so far as JSON, replacing the file atomically. Values are redacted before
+    encoding: JSON escaping could otherwise hide a key containing a quote or backslash."""
+    clean = [{k: redact(v, known_keys) if isinstance(v, str) else v for k, v in row.items()} for row in rows]
     path = Path(path)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(redact(json.dumps(rows, indent=2), known_keys) + "\n", encoding="utf-8")
+    tmp.write_text(json.dumps(clean, indent=2) + "\n", encoding="utf-8")
     os.replace(str(tmp), str(path))
 
 
@@ -80,9 +95,10 @@ def run_case(profile, key, case, settings, secret_names, known_keys, keep, repea
         ("hidden_passed", None), ("changed_files", None), ("passed", False), ("error", None),
         ("summary", None), ("hidden_output", None),
     ])
+    env = run_env(secret_names, settings.pass_env)
     try:
         repo.mkdir()
-        prepare_repo(case, repo)
+        prepare_repo(case, repo, env)
         limits = clamp_limits(settings.limits, case.limits.get("max_steps"), case.limits.get("max_seconds"))
         result = smoke.run_agent(profile, key, repo, case.task, case.check, secret_names, limits, traj,
                                  known_keys, settings.pass_env, case.hint_files)
@@ -90,8 +106,11 @@ def run_case(profile, key, case, settings, secret_names, known_keys, keep, repea
                    input_tokens=result.input_tokens, output_tokens=result.output_tokens,
                    check_exit=result.check.exit_code if result.check else None,
                    error=result.error or result.limit, summary=result.summary)
-        row["changed_files"] = changed_files(repo)
-        passed, output = run_hidden(case, repo, run_env(secret_names, settings.pass_env))
+        try:
+            row["changed_files"] = changed_files(repo, env)
+        except (subprocess.CalledProcessError, OSError):  # e.g. the model broke .git; still score it
+            pass
+        passed, output = run_hidden(case, repo, env)
         row["hidden_passed"] = passed
         row["hidden_output"] = output_tail(output, known_keys)
         row["passed"] = result.status == "done" and passed
@@ -159,7 +178,13 @@ def main(argv=None):
         print(exc)
         return 1
 
-    rows, kept = [], []
+    if args.out:
+        try:
+            check_out_path(args.out)  # a bad path fails here, before any paid run
+        except OSError as exc:
+            print("Cannot write --out file %s: %s" % (args.out, exc.strerror or exc))
+            return 1
+    rows, kept, out_ok = [], [], True
     for profile, key in keyed:
         for case in cases:
             for repeat in range(1, args.repeat + 1):
@@ -168,7 +193,12 @@ def main(argv=None):
                                            args.keep, repeat)
                 rows.append(row)
                 if args.out:  # after every run, so a crash or Ctrl-C keeps the finished rows
-                    write_rows(args.out, rows, known_keys)
+                    try:
+                        write_rows(args.out, rows, known_keys)
+                        out_ok = True
+                    except OSError as exc:  # keep running; the table below still has every row
+                        out_ok = False
+                        print("could not write %s: %s" % (args.out, exc), file=sys.stderr)
                 if args.keep:
                     kept.append(("%s %s #%d" % (profile.name, case.name, repeat), repo, traj))
 
@@ -192,7 +222,7 @@ def main(argv=None):
         print("kept %s: %s" % (label, repo))
         print("trajectory %s: %s" % (label, traj))
     if args.out:
-        print("wrote %s" % args.out)
+        print(("wrote %s" if out_ok else "could not write %s (see the errors above)") % args.out)
     return 0
 
 

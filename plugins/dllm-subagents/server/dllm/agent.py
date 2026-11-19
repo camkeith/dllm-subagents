@@ -24,6 +24,7 @@ from .tools import TOOL_SCHEMAS, ToolContext, ToolError, run_tool, scrub_cuts
 from .tools import redact as _redact
 
 TOOL_RESULT_MAX_CHARS = 30_000
+MUTATING_TOOLS = ("edit", "write")  # a failed call to one of these blocks a finish in the same response
 CHECK_TAIL_CHARS = 4_000
 
 FORMAT_ERROR_MESSAGE = (
@@ -207,10 +208,11 @@ class Agent:
         bad_format = False
         pending_stop: Optional[_Stop] = None
         finished = False
-        failed = False  # an earlier call in this response returned an error
+        failed = False  # an earlier edit or write in this response failed
+        skip_message = "This call was not run: finish was already called in this response."
         for i, call in enumerate(calls):
             if finished:
-                self._tool_message(call.id, "This call was not run: finish was already called in this response.")
+                self._tool_message(call.id, skip_message)
                 continue
             if self.ctx.cancel_event.is_set():
                 for rest in calls[i:]:
@@ -225,7 +227,8 @@ class Agent:
                 if not isinstance(args, dict):
                     raise ValueError("expected a JSON object")
             except ValueError as exc:
-                bad_format = failed = True
+                bad_format = True
+                failed = failed or call.name in MUTATING_TOOLS
                 self._progress("%s: invalid arguments" % call.name)
                 self._tool_message(call.id, "Error: invalid JSON arguments: %s" % exc)
                 continue
@@ -233,14 +236,15 @@ class Agent:
             if call.name == "finish" and failed:
                 # Finishing on top of a failed edit would report work that did not happen.
                 finished = True
-                self._tool_message(call.id, "This finish was not run: an earlier call in this response "
-                                   "failed. Read its error, fix it, then call finish again.")
+                skip_message = "This call was not run: it came after a finish that was refused."
+                self._tool_message(call.id, "This finish was not run: an earlier edit or write in this "
+                                   "response failed. Read its error, fix it, then call finish again.")
             elif call.name == "finish":
                 finished = True
                 pending_stop = self._handle_finish(call.id, args)
             else:
                 output = self._run_tool(call.name, args)
-                failed = failed or output.startswith("Error:")
+                failed = failed or (call.name in MUTATING_TOOLS and output.startswith("Error:"))
                 self._tool_message(call.id, output)
         if pending_stop is not None:
             raise pending_stop

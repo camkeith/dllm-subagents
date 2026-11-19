@@ -389,7 +389,26 @@ class AgentTest(unittest.TestCase):
         msgs = [m["content"] for m in self.client.calls[1] if m["role"] == "tool"]
         self.assertTrue(msgs[0].startswith("Error:"))
         self.assertIn("finish was not run", msgs[1])
-        self.assertIn("not run", msgs[2])
+        self.assertIn("came after a finish that was refused", msgs[2])
+
+    def test_finish_after_malformed_write_in_same_response_not_run(self):
+        c = tool_completion(("write", "{not json"), ("finish", {"summary": "s"}))
+        res = self.agent([c, finish("fixed")]).run("task")
+        self.assertEqual((res.status, res.summary, res.steps), ("done", "fixed", 2))
+        msgs = [m["content"] for m in self.client.calls[1] if m["role"] == "tool"]
+        self.assertIn("finish was not run", msgs[1])
+
+    def test_finish_after_malformed_read_still_runs(self):
+        c = tool_completion(("read", "{not json"), ("finish", {"summary": "s"}))
+        res = self.agent([c]).run("task")
+        self.assertEqual((res.status, res.steps), ("done", 1))
+
+    def test_finish_after_failed_read_still_runs(self):
+        # Only a failed edit or write means the summary could claim work that did not happen.
+        c = tool_completion(("read", {"path": "missing.py"}), ("write", {"path": "a.txt", "content": "x"}),
+                            ("finish", {"summary": "s"}))
+        res = self.agent([c]).run("task")
+        self.assertEqual((res.status, res.steps), ("done", 1))
 
     def test_finish_after_failed_bash_command_still_runs(self):
         # A nonzero exit is output, not a tool error: the check command is what judges the work.

@@ -6,6 +6,7 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -347,6 +348,81 @@ class RunnerUnitTests(unittest.TestCase):
                 self.main("--case", "spec_module", "--repeat", "2", "--out", self.out)
         with open(self.out) as f:
             self.assertEqual(len(json.load(f)), 1)
+
+    def test_out_in_missing_dir_fails_before_any_run(self):
+        with mock.patch.object(evals, "run_case") as rc:
+            code, out = self.main("--case", "spec_module", "--out", os.path.join(self.tmp.name, "no", "r.json"))
+        self.assertEqual(code, 1)
+        self.assertIn("Cannot write --out file", out)
+        rc.assert_not_called()
+
+    def test_out_keeps_an_existing_file_until_the_first_row(self):
+        with open(self.out, "w") as f:
+            f.write("old results")
+        with mock.patch.object(evals, "run_case", side_effect=KeyboardInterrupt()):
+            with self.assertRaises(KeyboardInterrupt):
+                self.main("--case", "spec_module", "--out", self.out)
+        with open(self.out) as f:
+            self.assertEqual(f.read(), "old results")
+        self.assertFalse(os.path.exists(self.out + ".tmp"))
+
+    def test_out_write_failure_mid_run_keeps_going(self):
+        real = evals.write_rows
+        calls = []
+
+        def flaky(path, rows, keys):
+            calls.append(len(rows))
+            if rows:
+                raise OSError("disk full")
+            return real(path, rows, keys)
+
+        with mock.patch.object(evals, "write_rows", side_effect=flaky), \
+                mock.patch.object(evals, "run_case", side_effect=lambda *a: (_row(repeat=a[-1]), None, None)):
+            buf_err = io.StringIO()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf_err):
+                code = evals.main(["--case", "spec_module", "--repeat", "2", "--out", self.out])
+        self.assertEqual(code, 0)
+        self.assertIn("could not write", buf_err.getvalue())
+        self.assertIn("Per case", buf.getvalue())
+        self.assertNotIn("wrote %s" % self.out, buf.getvalue())
+        self.assertIn("could not write %s" % self.out, buf.getvalue())
+
+    def test_changed_files_ignores_repo_fsmonitor_and_git_dir(self):
+        repo = Path(self.tmp.name) / "repo"
+        repo.mkdir()
+        env = dict(os.environ, **isolated_git_env(self.tmp.name))
+        evals.git(repo, "init", "-q", env=env)
+        marker = Path(self.tmp.name) / "marker"
+        hook = Path(self.tmp.name) / "hook.sh"
+        hook.write_text("#!/bin/sh\ntouch %s\n" % marker)
+        hook.chmod(hook.stat().st_mode | stat.S_IXUSR)
+        subprocess.run(["git", "config", "core.fsmonitor", str(hook)], cwd=str(repo), check=True, env=env)
+        (repo / "a.txt").write_text("x")
+        env["GIT_DIR"] = os.path.join(self.tmp.name, "elsewhere")
+        self.assertEqual(evals.changed_files(repo, env), 1)
+        self.assertFalse(marker.exists())
+
+    def test_changed_files_error_does_not_lose_the_score(self):
+        result = AgentResult(status="done", summary="s", limit=None, error=None, check=None, steps=1,
+                             seconds=0.1, input_tokens=1, output_tokens=1)
+        case = eval_cases.CASES_BY_NAME["spec_module"]
+        broken = subprocess.CalledProcessError(128, ["git", "status"])
+        with mock.patch.object(evals.smoke, "run_agent", return_value=result), \
+                mock.patch.object(evals, "changed_files", side_effect=broken), \
+                mock.patch.object(evals, "run_hidden", return_value=(True, "ok")):
+            row, _, _ = evals.run_case(PROFILE, FAKE_KEY, case, evals.smoke.load_providers()[0], [],
+                                       [FAKE_KEY], False, 1)
+        self.assertEqual((row["passed"], row["changed_files"], row["error"]), (True, None, None))
+
+    def test_write_rows_redacts_keys_that_json_would_escape(self):
+        key = 'sk-a"b\\c-123456'
+        row = _row(error="provider said " + key)
+        evals.write_rows(self.out, [row], [key])
+        with open(self.out) as f:
+            text = f.read()
+        self.assertEqual(json.loads(text)[0]["error"], "provider said ***")
+        self.assertFalse(os.path.exists(self.out + ".tmp"))
 
     def test_hidden_check_crash_is_recorded_and_printed(self):
         result = AgentResult(status="done", summary="s", limit=None, error=None, check=None, steps=1,
